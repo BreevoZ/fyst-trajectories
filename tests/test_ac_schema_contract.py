@@ -627,7 +627,9 @@ def test_emitted_source_ces_keys_partition_against_the_execution_layer_pin():
 
     The calibration-night dispatch sheet names, under each pass row, the
     awaiting keys that row's dict carries; the simulator cannot import from
-    tests, so it keeps its own copy of the set, held equal to this one here.
+    tests, so it keeps its own copy of the set, held equal to this one here
+    (and ``examples/planet_night_visits.py`` keeps a third, held equal to the
+    sheet's by its own test).
 
     The snapshot is re-cut only on a deliberate re-pin of the execution layer
     (see tests/data/README.md). A failure here means a key changed class:

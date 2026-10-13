@@ -9,12 +9,12 @@ The one thing the child is not allowed to inherit from the reader is Earth
 orientation: ``conftest.py`` pins the suite to the vendored IERS table, and a
 fresh interpreter starts with none of that, so an unpinned launch would reach
 for the network (or fail on a cold machine without one) and compute with
-whatever EOP the runner happened to fetch. The pin is passed in through a
-``sitecustomize`` shim on the child's import path; the examples themselves are
-untouched and a reader still runs them exactly as documented.
+whatever EOP the runner happened to fetch. The pin is passed in through the
+``example_env`` fixture of ``conftest.py``, a ``sitecustomize`` shim on the
+child's import path; the examples themselves are untouched and a reader still
+runs them exactly as documented.
 """
 
-import os
 import re
 import subprocess
 import sys
@@ -28,35 +28,6 @@ pytestmark = pytest.mark.offline
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = REPO_ROOT / "examples" / "overhead_from_csv.py"
 SAMPLE_CSV = REPO_ROOT / "examples" / "sample_sourcelist.csv"
-IERS_TABLE = Path(__file__).resolve().parent / "data" / "finals2000A.all"
-
-# Applied by the child interpreter at startup, and inert unless the launcher
-# asks for it: a sitecustomize on PYTHONPATH shadows any the environment
-# provides, so it must do nothing to anything else.
-_SITECUSTOMIZE = '''"""Apply the test suite's vendored IERS pin in a subprocess."""
-
-import os
-
-from astropy.utils import iers
-
-_table = os.environ.get("FYST_IERS_TABLE")
-if _table:
-    iers.conf.auto_download = False
-    iers.earth_orientation_table.set(iers.IERS_A.open(_table))
-    iers.conf.iers_degraded_accuracy = "warn"
-'''
-
-
-@pytest.fixture(scope="module")
-def example_env(tmp_path_factory):
-    """Build the child environment that carries the suite's IERS pin."""
-    directory = tmp_path_factory.mktemp("iers_pin")
-    (directory / "sitecustomize.py").write_text(_SITECUSTOMIZE, encoding="utf-8")
-    env = dict(os.environ)
-    env["FYST_IERS_TABLE"] = str(IERS_TABLE)
-    inherited = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{directory}{os.pathsep}{inherited}" if inherited else str(directory)
-    return env
 
 
 def test_example_child_uses_the_vendored_iers_table(example_env, tmp_path):
@@ -81,7 +52,7 @@ def test_example_child_uses_the_vendored_iers_table(example_env, tmp_path):
     result = subprocess.run([sys.executable, str(probe)], env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert "auto_download False" in result.stdout
-    assert f"table {IERS_TABLE}" in result.stdout
+    assert f"table {example_env['FYST_IERS_TABLE']}" in result.stdout
 
 
 def test_overhead_from_csv_example_runs(example_env):
@@ -117,11 +88,17 @@ def test_overhead_from_csv_example_runs(example_env):
 
 PLANET_NIGHT = REPO_ROOT / "examples" / "planet_night.py"
 SPEED_SWEEP = REPO_ROOT / "examples" / "planet_speed_sweep.py"
+# Exercised beside the short-night fixture it needs.
+PLANET_NIGHT_VISITS = REPO_ROOT / "examples" / "planet_night_visits.py"
+PLANET_NIGHT_VISITS_TEST = (
+    REPO_ROOT / "tests" / "overhead" / "calibration_night" / "test_visits_example.py"
+)
 
 
 def test_every_bundled_example_is_exercised():
-    """A new file under examples/ needs a test here."""
-    exercised = {EXAMPLE.name, PLANET_NIGHT.name, SPEED_SWEEP.name}
+    """A new file under examples/ needs a test, here or beside a fixture it uses."""
+    assert PLANET_NIGHT_VISITS_TEST.exists()
+    exercised = {EXAMPLE.name, PLANET_NIGHT.name, SPEED_SWEEP.name, PLANET_NIGHT_VISITS.name}
     assert {p.name for p in (REPO_ROOT / "examples").glob("*.py")} == exercised
 
 

@@ -8,6 +8,7 @@ should remain within the range of the vendored IERS table at
 epochs approach that limit, re-cut the snapshot (see ``tests/data/README.md``).
 """
 
+import os
 from collections import defaultdict
 from pathlib import Path
 
@@ -45,6 +46,37 @@ if _IERS_A_FILE.exists():
 # checks) that lie past any real IERS table. Degrade gracefully to UT1-UTC=0 there
 # instead of raising, and keep that deterministic regardless of test order.
 iers.conf.iers_degraded_accuracy = "warn"
+
+# A child interpreter a test launches (the bundled examples run as subprocesses)
+# inherits none of the pin above: it would start with auto-download on and
+# reach for the network, for the EOP table or for a leap-second update. The
+# pin is passed in through a sitecustomize shim on the child's import path,
+# inert unless FYST_IERS_TABLE is set, so a reader still runs the examples
+# exactly as documented.
+_EXAMPLE_SITECUSTOMIZE = '''"""Apply the test suite's vendored IERS pin in a subprocess."""
+
+import os
+
+from astropy.utils import iers
+
+_table = os.environ.get("FYST_IERS_TABLE")
+if _table:
+    iers.conf.auto_download = False
+    iers.earth_orientation_table.set(iers.IERS_A.open(_table))
+    iers.conf.iers_degraded_accuracy = "warn"
+'''
+
+
+@pytest.fixture(scope="session")
+def example_env(tmp_path_factory):
+    """Environment for a child interpreter that carries this suite's IERS pin."""
+    directory = tmp_path_factory.mktemp("iers_pin")
+    (directory / "sitecustomize.py").write_text(_EXAMPLE_SITECUSTOMIZE, encoding="utf-8")
+    env = dict(os.environ)
+    env["FYST_IERS_TABLE"] = str(_IERS_A_FILE)
+    inherited = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{directory}{os.pathsep}{inherited}" if inherited else str(directory)
+    return env
 
 
 def pytest_addoption(parser):

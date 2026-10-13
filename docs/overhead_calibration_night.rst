@@ -78,7 +78,10 @@ Both views are rendered from the timeline's blocks and metadata, so a
 sheet printed from a timeline read back from ECSV is byte-identical.
 
 For complete runnable scripts, see ``examples/planet_night.py`` (a night
-with its summary, dispatch sheet, ECSV and figures) and
+with its summary, dispatch sheet, ECSV and figures),
+``examples/planet_night_visits.py`` (the night read back from its ECSV and
+written as one JSON record per visit: the slews, the detector operations
+in order, and each pass's ``scan_params`` and ``scheduled_t0_unix``) and
 ``examples/planet_speed_sweep.py`` (a scripted speed sweep on one body)
 in the repository.
 

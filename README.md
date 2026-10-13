@@ -38,7 +38,3 @@ They are gated behind the `--run-slow` flag:
 ```bash
 pytest tests/ --run-slow
 ```
-
-## License
-
-BSD 3-Clause; see [LICENSE](LICENSE).
