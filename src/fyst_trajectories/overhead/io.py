@@ -8,6 +8,7 @@ import dataclasses
 import json
 import math
 import warnings
+from datetime import datetime
 from pathlib import Path
 
 from astropy import units as u
@@ -37,6 +38,36 @@ __all__ = [
     "read_timeline",
     "write_timeline",
 ]
+
+
+_UTC_SUFFIXES = ("+00:00", "Z")
+
+
+def _iso_utc(value: Time | str) -> str:
+    """Return the millisecond UTC ISO string with an explicit ``+00:00`` offset.
+
+    The digits are astropy's own millisecond rendering of the instant, the
+    form the dispatch sheet is rendered from; the offset keeps consumers that
+    parse with ``datetime.fromisoformat`` (TOAST's ``GroundSchedule``)
+    independent of the host timezone.
+    """
+    return _utc_instant(value).isot + "+00:00"
+
+
+def _read_time(value: str) -> Time:
+    """Read a UTC ISO string with a ``+00:00`` / ``Z`` suffix or none.
+
+    The UTC suffix is stripped so these strings take the same astropy parse
+    as files written without an offset; any other offset is converted to UTC.
+    """
+    text = value.strip()
+    for suffix in _UTC_SUFFIXES:
+        if text.endswith(suffix):
+            return Time(text[: -len(suffix)], scale="utc")
+    try:
+        return Time(text, scale="utc")
+    except ValueError:
+        return Time(datetime.fromisoformat(text), scale="utc")
 
 
 # Metadata key used for per-block retune event provenance. When a block's
@@ -111,9 +142,11 @@ def write_timeline(
     bounds only for science and calibration rows. ``az_final`` holds the
     azimuth a swept block ends at when that differs from ``azmax``, and
     is ``nan`` (read back as ``None``) on every other block.
-    Every time is written as a UTC ISO string to the millisecond, the form
-    ``read_timeline`` reads, whatever scale, ``precision`` or
-    ``out_subfmt`` the timeline's ``Time`` objects carry.
+    Every time is written as a UTC ISO string to the millisecond with an
+    explicit ``+00:00`` offset, the form ``read_timeline`` reads, whatever
+    scale, ``precision`` or ``out_subfmt`` the timeline's ``Time`` objects
+    carry. The offset keeps TOAST's ``datetime.fromisoformat`` parsing
+    independent of the host timezone.
     The timeline window, site, overhead model, and calibration policy
     are stored in the table header metadata, so ``read_timeline``
     restores them.
@@ -143,8 +176,8 @@ def write_timeline(
         meta_for_json = _encode_retune_events_for_json(dict(meta))
         rows.append(
             {
-                "start_time": _utc_instant(block.t_start).iso,
-                "stop_time": _utc_instant(block.t_stop).iso,
+                "start_time": _iso_utc(block.t_start),
+                "stop_time": _iso_utc(block.t_stop),
                 "boresight_angle": bangle,
                 "name": block.patch_name,
                 "azmin": block.az_start,
@@ -212,8 +245,8 @@ def write_timeline(
     # window would otherwise shrink to the block extents on read). Stored as ISO
     # strings in UTC, mirroring the block time columns. Files without these keys
     # fall back to the block-extent derivation in ``read_timeline``.
-    table.meta["timeline_start_time"] = _utc_instant(timeline.start_time).iso
-    table.meta["timeline_end_time"] = _utc_instant(timeline.end_time).iso
+    table.meta["timeline_start_time"] = _iso_utc(timeline.start_time)
+    table.meta["timeline_end_time"] = _iso_utc(timeline.end_time)
     table.meta["timeline_is_empty"] = substituted
     table.meta["site_name"] = timeline.site.name
     table.meta["site_description"] = timeline.site.description
@@ -291,6 +324,8 @@ def read_timeline(path: str | Path) -> ObservingTimeline:
     on raw durations is not. A planet pass's ``search_start`` is two floats in
     the ``block_meta_json`` column and reads back exactly, so the pass
     rebuilds the same from the file as from memory.
+    Times may carry a ``+00:00`` or ``Z`` suffix, or none (older files);
+    any other offset is converted to UTC.
 
     Parameters
     ----------
@@ -404,8 +439,8 @@ def read_timeline(path: str | Path) -> ObservingTimeline:
 
     blocks = []
     for row in rows:
-        t_start = Time(str(row["start_time"]), scale="utc")
-        t_stop = Time(str(row["stop_time"]), scale="utc")
+        t_start = _read_time(str(row["start_time"]))
+        t_stop = _read_time(str(row["stop_time"]))
 
         block_type = str(row["block_type"]) if has_block_type else "science"
         scan_type = str(row["scan_type"]) if has_scan_type else ""
@@ -487,8 +522,8 @@ def read_timeline(path: str | Path) -> ObservingTimeline:
     _meta_start = meta.get("timeline_start_time")
     _meta_end = meta.get("timeline_end_time")
     if _meta_start is not None and _meta_end is not None:
-        tl_start = Time(str(_meta_start), scale="utc")
-        tl_end = Time(str(_meta_end), scale="utc")
+        tl_start = _read_time(str(_meta_start))
+        tl_end = _read_time(str(_meta_end))
     elif blocks:
         tl_start = min(b.t_start for b in blocks)
         tl_end = max(b.t_stop for b in blocks)
@@ -610,8 +645,8 @@ def _empty_row() -> dict:
     """
     t0 = Time("2000-01-01T00:00:00", scale="utc")
     return {
-        "start_time": t0.iso,
-        "stop_time": t0.iso,
+        "start_time": _iso_utc(t0),
+        "stop_time": _iso_utc(t0),
         "boresight_angle": 0.0,
         "name": "",
         "azmin": 0.0,

@@ -17,6 +17,16 @@ the instrument team's ``IM0`` .. ``IM6`` in the first minor release after
 the correspondence to the as-built focal plane is confirmed; the two
 schemes do not correspond index-for-index (see :doc:`instrument_offsets`).
 
+Fixes that change results
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- **ECSV times carry an explicit UTC offset.** ``write_timeline`` writes
+  ``2026-11-01T09:00:00.123+00:00`` instead of ``2026-11-01 09:00:00.123``,
+  keeping the millisecond digits. TOAST's ``GroundSchedule`` parses these
+  strings with ``datetime.fromisoformat``, and without an offset its scan
+  times depended on the host timezone (+5 h on a host in New York, for
+  instance). ``read_timeline`` reads both forms, ``Z`` and other offsets.
+
 v0.10.0 (2026-10-06)
 --------------------
 
