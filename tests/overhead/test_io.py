@@ -297,7 +297,7 @@ class TestTimesAreWrittenInUtc:
         write_timeline(timeline, path)
 
         table = Table.read(path, format="ascii.ecsv")
-        millisecond = re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}")
+        millisecond = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}\+00:00")
         strings = [
             *table["start_time"],
             *table["stop_time"],
@@ -339,8 +339,8 @@ class TestCanonicalColumnNames:
 
         table = Table.read(str(path), format="ascii.ecsv")
         first = str(table["start_time"][0])
-        # ISO format looks like "2026-06-15 02:00:00.000"
-        assert first == "2026-06-15 02:00:00.000"
+        # ISO format with an explicit UTC offset, e.g. "2026-06-15T02:00:00.000+00:00"
+        assert first == "2026-06-15T02:00:00.000+00:00"
 
 
 class TestEmptyTimelineRoundTrip:

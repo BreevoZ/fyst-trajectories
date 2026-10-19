@@ -191,6 +191,14 @@ coordinates stored as ``Quantity`` header metadata. TOAST's
 ``GroundSchedule`` v5 reader can therefore read them directly, ignoring
 the FYST extension columns.
 
+All block times, timeline window metadata, and empty placeholder times are
+UTC ISO-8601 strings to the millisecond with an explicit ``+00:00`` offset,
+for example ``2026-08-02T01:25:00.123+00:00``. Without an offset, TOAST's
+``datetime.fromisoformat`` produces a naive datetime whose ``timestamp()``
+depends on the host timezone. ``read_timeline`` also accepts older
+offset-free UTC strings, ``Z``, and non-zero offsets, converting the latter
+to the corresponding UTC instant.
+
 Standard TOAST schedule files (without ``block_type``, ``scan_type``,
 ``rising``, or the patch-geometry extension columns) are also supported on
 read. They are interpreted as all-science timelines with sensible defaults
