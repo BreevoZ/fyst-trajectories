@@ -15,15 +15,20 @@ import numpy as np
 from astropy import units as u
 from astropy.time import Time, TimeDelta
 
-from ..._validation import _require_non_negative, _require_positive
+from ..._validation import AZ_PADDING_MAX_DEG, _require_non_negative, _require_positive
 from ...coordinates import Coordinates
-from ...exceptions import ElevationBoundsError, PointingWarning, TargetNotObservableError
+from ...exceptions import (
+    ElevationBoundsError,
+    PointingError,
+    PointingWarning,
+    TargetNotObservableError,
+)
 from ...offsets import InstrumentOffset
 from ...site import AtmosphericConditions, Site
 from .._helpers import _coerce_start_time
 from .._types import ArrayFootprint
 from ..footprints import resolve_footprint
-from ._kernel import _DEFAULT_SEARCH_HORIZON_HOURS, _compute_source_ces_core
+from ._kernel import _DEFAULT_SEARCH_HORIZON_HOURS, _compute_source_ces_core, _project_footprint
 from ._source import _SourceSpec
 
 # --- Approximate-start-time ("anchor") resolution constants ---------------
@@ -45,8 +50,11 @@ _ANCHOR_SLOPE_DT_SEC = 60.0
 # so a probe el_bore this far beyond the anchor elevation puts the whole
 # projected cover beyond the anchor elevation (no clip at the window's
 # opening edge) while keeping the probe close enough that the geometry it
-# measures matches the final solve. Near culmination the cover's far side can
-# still lie beyond the source's arc, which the probe's allow_partial absorbs.
+# measures nearly matches the final solve (the focal-plane rotation turns an
+# off-centre cover between the two, which _derive_anchored_el_bore checks for).
+# Near culmination the cover's far side can still lie beyond the source's arc,
+# which the probe's allow_partial absorbs; a source that turns before it
+# reaches the probe at all is left to _derive_anchored_el_bore's fallback.
 _ANCHOR_PROBE_BUFFER_DEG = 0.1
 
 # Deliberate elevation lead applied to the derived el_bore so the resolved
@@ -55,8 +63,26 @@ _ANCHOR_PROBE_BUFFER_DEG = 0.1
 # without this lead the footprint's near-anchor cover edge sits on the
 # window boundary, where the elevation-crossing slice is prone to clip. At
 # typical source drift rates this places the start within about a minute of
-# the anchor.
+# the anchor. A cover that leads the boresight along the source's motion
+# starts later; see _derive_anchored_el_bore.
 _ANCHOR_START_LEAD_DEG = 0.05
+
+# Fixed-point steps of the re-solve that moves the derived el_bore when the
+# cover's near edge, projected there, lies behind the source at the anchor
+# (see _derive_anchored_el_bore). The edge moves with el_bore at unit rate,
+# give or take what the focal-plane rotation does to an off-centre cover (a
+# few hundredths of a degree per degree for a ring module), so each step
+# multiplies the residual by that excess and three leave the edge well
+# within 1e-3 deg of its target, a small part of the lead: from the
+# hundredths of a degree the rotation moves the edge between the probe and
+# the derived el_bore, and from the 2.4 deg a ring module's cover can reach
+# behind the boresight when the probe is out of reach (a few 1e-5 deg left).
+# That holds for a source that culminates well below the zenith. Near the
+# zenith the rotation turns the cover faster as el_bore moves, the excess
+# grows and three steps leave more; in every case measured the edge still
+# fell short of its target rather than past it, so it stays ahead of the
+# source by most of the lead.
+_ANCHOR_EDGE_STEPS = 3
 
 # Minimum source elevation drift rate (deg/s) for deriving el_bore from an
 # anchor. The binding requirement is timing: the derivation leads the anchor
@@ -149,10 +175,35 @@ def _anchored_el_limits_error(
     )
 
 
+def _near_cover_edge(
+    fp: ArrayFootprint,
+    el_bore: float,
+    boresight_rot: float | None,
+    site: Site,
+    drift_sign: float,
+) -> float:
+    """Return the elevation of the cover edge the source meets first, projected at ``el_bore``.
+
+    The lowest projected vertex for a rising source (``drift_sign`` +1), the
+    highest for a setting one, taken from the kernel's own footprint stage.
+    A vertex's elevation does not depend on the boresight azimuth, so the
+    projection is made at azimuth 0.
+    """
+    _, _, el_cover = _project_footprint(
+        fp=fp,
+        site=site,
+        el_bore=el_bore,
+        boresight_rot_deg=0.0 if boresight_rot is None else float(boresight_rot),
+        src_az_at_el_bore=0.0,
+    )
+    return float(el_cover.min()) if drift_sign > 0.0 else float(el_cover.max())
+
+
 def _derive_anchored_el_bore(
     *,
     anchor: Time,
     el_at_anchor: float,
+    slope: float,
     mode: Literal["rising", "setting"],
     coords: Coordinates,
     fp: ArrayFootprint,
@@ -167,21 +218,71 @@ def _derive_anchored_el_bore(
 ) -> float:
     """Derive the ``el_bore`` whose pass starts approximately at ``anchor``.
 
-    A source-tracking CES starts (rising) or ends (setting) when the source
-    crosses the footprint's lower/upper projected elevation edge, so
-    ``el_bore = el(anchor)`` would centre the pass on the anchor and begin it
-    earlier. This runs one probe of the params-only kernel at a lifted
-    ``el_bore`` (far enough past the anchor elevation that the source meets
-    the cover only after the anchor), reads the source elevation at the
-    probe's resolved start, and shifts ``el_bore`` so that crossing lands on
-    the anchor. A small :data:`_ANCHOR_START_LEAD_DEG` lead is added in the
-    drift direction so the resolved start settles just after the anchor,
-    clear of the search-window boundary. One probe, no iteration. The anchor
-    places the full footprint crossing; a ``dwell`` narrows the pass about
-    that crossing's midpoint afterwards, so a dwell-limited pass starts half
-    the cut after the anchor (placing the narrowed start on the anchor would
-    open the crossing before the search window and trip the cover-vs-arc
-    guard).
+    A source-tracking CES starts when the source reaches the cover's near
+    edge, its lowest projected vertex for a rising source and its highest
+    for a setting one, so ``el_bore = el(anchor)`` would centre the pass on
+    the anchor and begin it earlier. This runs one probe of the params-only
+    kernel at a lifted ``el_bore`` (past the anchor elevation by the cover's
+    full reach from the boresight, so that the source meets the cover only
+    after the anchor at any focal-plane rotation), reads the source
+    elevation at the probe's resolved start, and shifts ``el_bore`` so that
+    crossing lands on the anchor. A small :data:`_ANCHOR_START_LEAD_DEG`
+    lead is added in the drift direction so the resolved start settles just
+    after the anchor, clear of the search-window boundary. One probe, no
+    iteration of the kernel. The anchor places the full footprint crossing;
+    a ``dwell`` narrows the pass about that crossing's midpoint afterwards,
+    so a dwell-limited pass starts half the cut after the anchor (placing
+    the narrowed start on the anchor would open the crossing before the
+    search window and trip the cover-vs-arc guard). The caller's
+    ``allow_partial`` is not read here: it is the real solve's tolerance for
+    a source that turns before it crosses the whole cover, and the checks
+    below put the near edge ahead of the source whether or not it is set,
+    so a derived pass is never clipped at the anchor.
+
+    When the source moves in the ``mode`` direction at the anchor, the arc
+    the search needs starts there, and the real solve refuses unless the
+    boresight elevation and the near edge both lie ahead of the source at
+    the anchor. (An explicit ``mode`` against the source's motion is met on
+    an arc that starts at the source's next turn, which the anchor does not
+    bound, and the probe's value stands.) The direction is read from
+    ``slope``, the elevation rate :func:`_resolve_anchor_prefix` measured at
+    the anchor, the same probe that resolves an omitted ``mode``, so a
+    derived mode always moves along. So two checks follow the probe:
+
+    * A cover that leads the boresight along the source's motion (above it
+      while the source rises, below it while it sets) by more than the lead
+      puts the derived ``el_bore`` behind the source, which then meets it
+      only on the next day's arc. ``el_bore`` is then anchored on the source
+      instead, the lead ahead of its elevation at the anchor: the source
+      crosses it shortly after the anchor, and the pass starts when the
+      source reaches the cover, the cover's elevation lead divided by the
+      source's elevation rate later (minutes for a ring module).
+    * The probe measures the near edge at its own ``el_bore``, but the
+      focal-plane rotation turns an off-centre cover as ``el_bore``
+      changes, so at the derived value the edge can lie behind the source
+      at the anchor, where the pass would open before the window does.
+      ``el_bore`` is then re-solved, by fixed-point steps on the kernel's
+      own cover projection, to put the edge the lead ahead of the source.
+
+    Where neither applies, as always for the centre module (a circle about
+    the boresight projects nearly the same at every ``el_bore``), the probe's
+    value is returned unchanged.
+
+    The full reach suits every rotation but is more lift than most covers
+    need, and near its culmination (its lower culmination, setting) a source
+    moving in the ``mode`` direction can turn before it reaches the probe's
+    elevation or the lifted cover, which the probe refuses. The source's
+    elevation at the anchor plus the lead then stands in for the probe's
+    value, and the second check's fixed-point steps lift it by as much as
+    the cover, projected there, reaches behind the source: the lift this
+    cover needs at this rotation, up to the full reach for a cover that
+    trails the boresight and only the lead for one that leads it. The real
+    solve then plans the pass where the source, before it turns, reaches
+    both the derived ``el_bore`` and the whole cover. Where it turns inside
+    the cover the pass is refused, or clipped under ``allow_partial``.
+    Where it turns short of ``el_bore`` (a cover trailing the boresight can
+    fit below the turn while its boresight does not) the pass is refused
+    either way.
 
     The probe sweeps with the kernel's default padding, never the caller's
     ``az_padding``, which it does not need. So that padding is checked here,
@@ -193,22 +294,32 @@ def _derive_anchored_el_bore(
     the probe or the derived ``el_bore`` falls outside the telescope
     elevation limits, e.g. the source is below the elevation floor at the
     anchor; the probe's :class:`ElevationBoundsError` is preserved as the
-    ``__cause__``. The probe's other refusals propagate unchanged: a
+    ``__cause__``. The probe's ``OffsetInversionError``, raised when the
+    off-centre boresight inverse fails at its elevation, propagates
+    unchanged, and so do its other refusals for a source that does not move
+    in the ``mode`` direction at the anchor: a
     :class:`TargetNotObservableError` when the source never reaches the
-    probe's elevation, an ``OffsetInversionError`` when the off-centre
-    boresight inverse fails there, and a ``PointingError`` when, near
-    culmination, the source reaches none of the lifted cover's vertices.
+    probe's elevation, and a ``PointingError`` when it reaches none of the
+    lifted cover's vertices. The checks' own projection of the cover raises
+    an ``OffsetInversionError`` too where the off-centre inverse fails at an
+    ``el_bore`` they try, as it can for a source that culminates within
+    about a degree of the zenith.
     """
-    _require_positive(sampling_step_seconds, "sampling_step_seconds")
-    _require_positive(az_accel, "az_accel")
-    _require_non_negative(az_padding, "az_padding")
+    sampling_step_seconds = _require_positive(sampling_step_seconds, "sampling_step_seconds")
+    az_accel = _require_positive(az_accel, "az_accel")
+    _require_non_negative(az_padding, "az_padding", maximum=AZ_PADDING_MAX_DEG)
     drift_sign = 1.0 if mode == "rising" else -1.0
+    target = el_at_anchor + drift_sign * _ANCHOR_START_LEAD_DEG
+    # Whether the source moves in the mode direction at the anchor, which the
+    # two checks below and the fallback for a probe out of reach require.
+    along = (slope >= 0.0) == (drift_sign > 0.0)
     # The projected elevation deviation of any cover vertex is bounded by its
     # angular distance from the boresight (focal-plane origin), so lifting the
     # probe el_bore by more than that distance puts the whole cover beyond the
-    # anchor elevation regardless of the field rotation, and the crossing
+    # anchor elevation regardless of the focal-plane rotation, and the crossing
     # begins after the window opens. Near culmination the source can turn
-    # back before it crosses all of the cover, which allow_partial tolerates.
+    # back before it crosses all of the cover, which allow_partial tolerates,
+    # or before it reaches the probe at all, which the fallback below handles.
     r_bore = float(np.hypot(fp.cover_xi_deg, fp.cover_eta_deg).max())
     margin = r_bore + _ANCHOR_PROBE_BUFFER_DEG
     el_bore_probe = el_at_anchor + drift_sign * margin
@@ -254,8 +365,43 @@ def _derive_anchored_el_bore(
         raise _anchored_el_limits_error(
             anchor=anchor, el_at_anchor=el_at_anchor, source=source, site=site
         ) from err
-    el_at_probe_t0 = _source_el_at(coords, probe.t0, source=source)
-    derived = el_bore_probe + (el_at_anchor - el_at_probe_t0) + drift_sign * _ANCHOR_START_LEAD_DEG
+    except PointingError as err:
+        # Only a TargetNotObservableError (the source never reaches the probe's
+        # el_bore) or the kernel's plain PointingError (it reaches no vertex of
+        # the lifted cover) says the source turns within the cover's full reach;
+        # any other refusal, an OffsetInversionError among them, propagates.
+        # For a source moving in the mode direction, the source's elevation
+        # plus the lead stands in for the probe's value, and the checks below
+        # lift it by as much as the cover, projected there, reaches behind the
+        # source.
+        out_of_reach = isinstance(err, TargetNotObservableError) or type(err) is PointingError
+        if not (out_of_reach and along):
+            raise
+        derived = target
+    else:
+        el_at_probe_t0 = _source_el_at(coords, probe.t0, source=source)
+        derived = (
+            el_bore_probe + (el_at_anchor - el_at_probe_t0) + drift_sign * _ANCHOR_START_LEAD_DEG
+        )
+    # The two checks of the docstring, for a source moving in the mode
+    # direction. Both are strict, so a value that puts the boresight elevation
+    # and the near edge at or ahead of the source is returned bit for bit.
+    edge = _near_cover_edge(fp, derived, boresight_rot, site, drift_sign)
+    bore_behind = drift_sign * (derived - el_at_anchor) < 0.0
+    edge_behind = drift_sign * (edge - el_at_anchor) < 0.0
+    if (bore_behind or edge_behind) and along:
+        if bore_behind:
+            # The cover leads the boresight: anchor on the source.
+            derived = target
+            edge = _near_cover_edge(fp, derived, boresight_rot, site, drift_sign)
+        if drift_sign * (edge - el_at_anchor) < 0.0:
+            # The near edge lies behind the source: the focal-plane rotation
+            # turned it there between the probe's el_bore and this one, or,
+            # with the probe out of reach, the cover reaches behind the
+            # boresight.
+            for _ in range(_ANCHOR_EDGE_STEPS):
+                derived += target - edge
+                edge = _near_cover_edge(fp, derived, boresight_rot, site, drift_sign)
     # The probe sits farther from the anchor elevation than the derived value
     # in most geometries, but not in all of them; pre-check the derived
     # el_bore too so an out-of-limits result surfaces with the same
@@ -313,7 +459,7 @@ def _resolve_anchor_prefix(
     source: _SourceSpec,
     site: Site,
     atmosphere: AtmosphericConditions | None,
-) -> tuple[Time, Coordinates, Literal["rising", "setting"], float]:
+) -> tuple[Time, Coordinates, Literal["rising", "setting"], float, float]:
     """Shared validation and slope probe for the anchored entry points.
 
     Common front half of every ``start_time`` resolution: validates that
@@ -321,9 +467,10 @@ def _resolve_anchor_prefix(
     anchor, and, when ``el_bore`` or ``mode`` is omitted, probes the source
     elevation slope at the anchor. The slope sign resolves an omitted
     ``mode``; the near-transit drift guard runs when ``el_bore`` must be
-    derived. Returns ``(anchor, coords, mode, el_at_anchor)``;
-    ``el_at_anchor`` is meaningful whenever ``el_bore`` is ``None`` (the
-    probe is guaranteed to have run in that case).
+    derived. Returns ``(anchor, coords, mode, el_at_anchor, slope)``;
+    ``el_at_anchor`` and ``slope`` (deg/s) are meaningful whenever
+    ``el_bore`` is ``None`` (the probe is guaranteed to have run in that
+    case).
     """
     if night is not None:
         raise ValueError("specify either 'start_time' or 'night', not both")
@@ -335,6 +482,7 @@ def _resolve_anchor_prefix(
 
     resolved_mode = mode
     el_at_anchor = 0.0
+    slope = 0.0
     if el_bore is None or mode is None:
         el_at_anchor, slope = _probe_anchor_slope(coords, anchor, source=source)
         if resolved_mode is None:
@@ -351,7 +499,7 @@ def _resolve_anchor_prefix(
             )
 
     assert resolved_mode is not None  # mode was given, or set from the probe slope above
-    return anchor, coords, resolved_mode, el_at_anchor
+    return anchor, coords, resolved_mode, el_at_anchor, slope
 
 
 def _resolve_start_time_anchor(
@@ -381,7 +529,7 @@ def _resolve_start_time_anchor(
     existing kernel with the returned values, so the classic paths are
     untouched.
     """
-    anchor, coords, resolved_mode, el_at_anchor = _resolve_anchor_prefix(
+    anchor, coords, resolved_mode, el_at_anchor, slope = _resolve_anchor_prefix(
         start_time=start_time,
         el_bore=el_bore,
         mode=mode,
@@ -399,6 +547,7 @@ def _resolve_start_time_anchor(
         el_bore = _derive_anchored_el_bore(
             anchor=anchor,
             el_at_anchor=el_at_anchor,
+            slope=slope,
             mode=resolved_mode,
             coords=coords,
             fp=resolve_footprint(footprint),

@@ -184,6 +184,10 @@ limits as keyword defaults (pass ``az_speed=`` and the others there).
      - ``DEFAULT_SCAN_TABLES["default"]``; 1.5 deg/s, 1.0 deg/s²
      - ``CalibrationNightPolicy(az_speed=, az_accel=)``,
        ``plan_calibration_night(tables=)``
+   * - Calibration-night dispatch lead
+     - 20 s: PCS's ``SCAN_DISPATCH_BUFFER_SEC`` (10 s) plus about 10 s
+       for the dispatch path
+     - ``CalibrationNightPolicy(dispatch_lead_seconds=)``
    * - Constant-elevation azimuth range
      - projection of the whole field over the whole pass (not an
        elevation-band drift corridor)

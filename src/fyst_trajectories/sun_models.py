@@ -19,8 +19,8 @@ the planners, and :func:`~fyst_trajectories.dispatch.choose_encoder_solution`:
   future release. The scalar also remains the commissioning fallback.
 
 The shared library is an *optional* dependency, imported lazily and pinned:
-:data:`SUN_AVOIDANCE_PINNED_SHA` records the revision the parity fixtures
-were generated against, and :data:`CAD_TABLE_SHA256` guards the CAD table
+:data:`SUN_AVOIDANCE_PINNED_SHA` records the revision the record-replay
+fixtures were generated against, and :data:`CAD_TABLE_SHA256` guards the CAD table
 bytes. ``"scalar"`` never needs it.
 
 Deviations from the shared library's own defaults (deliberate, documented):
@@ -115,7 +115,7 @@ __all__ = [
 ]
 
 SUN_AVOIDANCE_PINNED_SHA = "e6fa12aa53ce5f5f76d50f8b753e7fe4b4ad8e18"
-"""ccatobs/sun-avoidance revision the adapter and parity fixtures are built against."""
+"""ccatobs/sun-avoidance revision the adapter and record-replay fixtures are built against."""
 
 CAD_TABLE_SHA256 = "bdac30878877b20d14fe20fff5d1bd12531306a50eb879a4babfe57ef4216f3b"
 """SHA-256 of ``sa_safe_CAD_20231030.csv`` at the pinned revision, over LF line endings.
@@ -123,7 +123,7 @@ CAD_TABLE_SHA256 = "bdac30878877b20d14fe20fff5d1bd12531306a50eb879a4babfe57ef421
 The loader folds CRLF to LF before hashing, so a Windows checkout
 (``core.autocrlf``) and a Linux one of the same revision agree. It refuses a
 table whose bytes differ otherwise: a revised CAD model must arrive as a
-deliberate re-pin (new SHA, regenerated parity fixtures), never as a silent
+deliberate re-pin (new SHA, regenerated record-replay fixtures), never as a silent
 behaviour change.
 """
 
@@ -213,7 +213,7 @@ def load_avoidance_data(model: str = "cad", *, radius: float | None = None) -> A
                 f"CAD table {table} has SHA-256 {digest}, expected {CAD_TABLE_SHA256} "
                 f"(pinned at sun-avoidance {SUN_AVOIDANCE_PINNED_SHA}). The installed "
                 "library revision differs from the pin; re-pin deliberately (update "
-                "SUN_AVOIDANCE_PINNED_SHA / CAD_TABLE_SHA256 and regenerate the parity "
+                "SUN_AVOIDANCE_PINNED_SHA / CAD_TABLE_SHA256 and regenerate the record-replay "
                 "fixtures) rather than mixing revisions."
             )
         data = lib.AvoidanceData()
@@ -264,9 +264,11 @@ class _BaseSunModel:
         time grid, and a position array at a single instant. Higher-rank
         inputs are rejected (numpy broadcasting would silently outer-product
         them into wrong pairings) and mismatched 1-D lengths raise. Sun
-        positions for scalar times are cached per predicate: dispatch and
-        planning loops revisit the same instants across wraps and field
-        corners, and the ephemeris call dominates the per-point cost.
+        positions for scalar times are cached per predicate, and an array of
+        times is solved once per distinct instant (:meth:`_sun_at_instants`):
+        dispatch and planning loops revisit the same instants across wraps,
+        field corners and azimuth columns, and the ephemeris call dominates
+        the per-point cost.
         """
         az, el = self._validated_arrays(az_deg, el_deg)
         if times.isscalar:
@@ -283,7 +285,7 @@ class _BaseSunModel:
                 self._sun_cache[key] = cached
             sun_az, sun_el = cached
         else:
-            sun_az, sun_el = self._coords.get_sun_altaz(times)
+            sun_az, sun_el = self._sun_at_instants(times)
         sun_az = np.atleast_1d(np.asarray(sun_az, dtype=float))
         sun_el = np.atleast_1d(np.asarray(sun_el, dtype=float))
         az, el, sun_az, sun_el = np.broadcast_arrays(az, el, sun_az, sun_el)
@@ -291,6 +293,30 @@ class _BaseSunModel:
         # but it indexes and reshapes them; cheap insurance against a future
         # revision writing into a 0-stride broadcast view.
         return az.copy(), el.copy(), sun_az.copy(), sun_el.copy()
+
+    def _sun_at_instants(self, times: Time) -> tuple[np.ndarray, np.ndarray]:
+        """Return the Sun's ``(az, el)`` at each of an array of times, solved once per instant.
+
+        A grid that repeats each instant across many positions is solved for
+        each distinct ``(jd1, jd2)`` and spread back over the grid. Each
+        position depends on its instant alone, and the distinct instants are
+        those of the whole grid (astropy iterates the light-travel time until
+        every element has converged, so the iteration count is unchanged), so
+        the result is the one the whole grid gives, to the bit. A time array
+        with a location per element is solved as given, since the location
+        enters its conversion to TDB.
+        """
+        if times.location is not None and not times.location.isscalar:
+            return self._coords.get_sun_altaz(times)
+        jd = np.stack([np.ravel(times.jd1), np.ravel(times.jd2)], axis=-1)
+        # One key per instant: the raw bytes of its two parts.
+        keys = jd.view(np.dtype((np.void, 2 * jd.itemsize))).ravel()
+        _, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
+        if first.size == keys.size:
+            return self._coords.get_sun_altaz(times)
+        sun_az, sun_el = self._coords.get_sun_altaz(times.ravel()[first])
+        inverse = inverse.reshape(times.shape)
+        return np.asarray(sun_az)[inverse], np.asarray(sun_el)[inverse]
 
     @staticmethod
     def _validated_arrays(az_deg, el_deg) -> tuple[np.ndarray, np.ndarray]:

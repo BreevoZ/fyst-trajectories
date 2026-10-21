@@ -114,19 +114,33 @@ class TuningPolicy:
     find_detectors_duration : float, optional
         Duration of that operation in seconds. A placeholder pending an
         instrument-team value; default 300.
+    skydip_after_retune : bool, optional
+        Reserve a skydip immediately after the retune before each scan
+        block, at the same pose, so the dispatch lead follows that skydip;
+        a retune of zero duration is not scheduled, and then neither is
+        this skydip. It is in addition to the skydip reserved before the
+        retune whenever the cadence says one is due, and like any skydip it
+        restarts the cadence. Needs ``retune_before_each_block``. Default
+        False.
 
     Raises
     ------
     ValueError
-        If ``find_detectors_duration`` is negative or not finite.
+        If ``find_detectors_duration`` is negative or not finite, or
+        ``skydip_after_retune`` is set without ``retune_before_each_block``.
     """
 
     retune_before_each_block: bool = True
     find_detectors_at_start: bool = True
     find_detectors_duration: float = 300.0
+    skydip_after_retune: bool = False
 
     def __post_init__(self) -> None:
         _non_negative("find_detectors_duration", self.find_detectors_duration)
+        if self.skydip_after_retune and not self.retune_before_each_block:
+            raise ValueError(
+                "skydip_after_retune needs retune_before_each_block: the skydip follows the retune"
+            )
 
 
 @dataclass(frozen=True)
@@ -178,6 +192,30 @@ class CalibrationNightPolicy:
         table's throw is swept at and above the table's lowest bin
         (extrapolated above its top bin) and, below it, the kernel's
         default padded throw.
+    dispatch_lead_seconds : float, optional
+        Seconds reserved between the end of the detector operations and
+        the start of each pass. The planner's search for the pass, whose
+        start the dispatch sheet prints as ``scheduled_t0_unix``, begins
+        the lead after the operations' end as estimated before the slew is
+        planned (the estimate prices the slew to where the body will be at
+        the anchor and adds the settle), so it sits the lead after the
+        operations to within about a second for a single pass of the
+        centre module (a multi-pass visit or a ring module, planned for
+        simulation, up to a few seconds), while the pass itself, which
+        starts the kernel's own offset after the search start, never
+        starts sooner than the lead after them. The
+        execution layer floors a dispatch's start to
+        ``SCAN_DISPATCH_BUFFER_SEC`` after the dispatch (10 s in PCS at the
+        revision this library is checked against) and searches for the
+        pass from the later of that floor and ``scheduled_t0_unix``: a
+        later floor finds the same crossing to within some tens of
+        milliseconds, until it passes the pass start, where the task
+        refuses the pass. Default 20: PCS's 10 s floor plus about ten
+        seconds for the dispatch path (the completion of the operation
+        before the pass, the OCS round trips and the script's own
+        latency). A later pass of a multi-pass visit is kept only when it
+        starts at least the step to it plus the lead after the previous
+        kept pass ends. 0 reserves nothing.
     min_pass_seconds : float, optional
         The night ends when less than this remains. Default 60.
     retry_after_seconds : float, optional
@@ -202,8 +240,9 @@ class CalibrationNightPolicy:
     ValueError
         If ``el_min`` is outside [0, 90), a duration, ``az_speed`` or
         ``az_accel`` is not a positive, finite number,
-        ``footprint_margin`` or ``moon_min_separation`` is negative or
-        not finite, ``n_passes`` is below 1, or ``footprint`` is not a
+        ``footprint_margin``, ``dispatch_lead_seconds`` or
+        ``moon_min_separation`` is negative or not finite, ``n_passes``
+        is below 1, or ``footprint`` is not a
         str naming one Prime-Cam module (for an unknown name the message
         lists the names it takes).
     """
@@ -217,6 +256,7 @@ class CalibrationNightPolicy:
     n_passes: int = 1
     use_table_dwell: bool = False
     use_table_throw: bool = False
+    dispatch_lead_seconds: float = 20.0
     min_pass_seconds: float = 60.0
     retry_after_seconds: float = 300.0
     max_wait_seconds: float = 3600.0
@@ -239,6 +279,7 @@ class CalibrationNightPolicy:
         ):
             _positive(name, getattr(self, name))
         _non_negative("footprint_margin", self.footprint_margin)
+        _non_negative("dispatch_lead_seconds", self.dispatch_lead_seconds)
         if self.n_passes < 1:
             raise ValueError(f"n_passes must be at least 1, got {self.n_passes}")
         if self.moon_min_separation is not None:
@@ -259,11 +300,36 @@ def _policy_from_record(record: dict[str, Any]) -> CalibrationNightPolicy:
 
     A record without ``use_table_throw`` was written before the switch
     existed, when every pass swept the table's throw, so it is read as
-    ``use_table_throw=True``.
+    ``use_table_throw=True``; one without ``dispatch_lead_seconds`` was
+    written before the lead existed, when nothing was reserved in front
+    of a pass, so it is read as ``dispatch_lead_seconds=0.0``; and a
+    tuning record without ``skydip_after_retune`` was written before that
+    option existed, when no skydip followed the retune, so it is read as
+    ``skydip_after_retune=False``.
+
+    Raises
+    ------
+    ValueError
+        If the record, or its ``tuning`` record, holds a key the policy
+        does not have (a key from a later version of this library), named
+        in the message, or the policy it describes is one
+        :class:`CalibrationNightPolicy` refuses.
     """
     fields = dict(record)
+    tuning = dict(fields["tuning"])
+    unknown = sorted(set(fields) - {f.name for f in dataclasses.fields(CalibrationNightPolicy)})
+    unknown += [
+        f"tuning.{key}"
+        for key in sorted(set(tuning) - {f.name for f in dataclasses.fields(TuningPolicy)})
+    ]
+    if unknown:
+        raise ValueError(
+            "the recorded policy holds keys this version of the library does not know: "
+            + ", ".join(unknown)
+        )
     fields.setdefault("use_table_throw", True)
-    fields["tuning"] = TuningPolicy(**fields["tuning"])
+    fields.setdefault("dispatch_lead_seconds", 0.0)
+    fields["tuning"] = TuningPolicy(**{"skydip_after_retune": False, **tuning})
     return CalibrationNightPolicy(**fields)
 
 
@@ -304,8 +370,9 @@ class CalibrationNightMetadata(TypedDict):
         ``{"body", "at", "message"}``.
     telescope_limits : dict
         The site's axis limits, as nested dicts of the
-        :class:`~fyst_trajectories.site.TelescopeLimits` fields; the ECSV
-        header does not carry them.
+        :class:`~fyst_trajectories.site.TelescopeLimits` fields, which
+        :meth:`~fyst_trajectories.overhead.NightContext.from_timeline` holds
+        the site to.
     """
 
     targets: list[str]

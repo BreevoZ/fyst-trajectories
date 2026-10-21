@@ -236,7 +236,15 @@ def test_passes_setting_source_time_ordered(site):
             id="step-without-n_passes",
         ),
         pytest.param(dict(n_passes=3, step=-0.1), "step must be positive", id="negative-step"),
+        pytest.param(dict(n_passes=3, step="0.25"), "^step must be a real number", id="text-step"),
+        pytest.param(dict(n_passes=3, step=True), "^step must be a real number", id="bool-step"),
         pytest.param(dict(n_passes=3, el_step=0.0), "el_step must be positive", id="zero-el_step"),
+        pytest.param(
+            dict(n_passes=3, el_step="0.25"), "^el_step must be a real number", id="text-el_step"
+        ),
+        pytest.param(
+            dict(n_passes=3, el_step=True), "^el_step must be a real number", id="bool-el_step"
+        ),
     ],
 )
 def test_passes_invalid_controls_raise_value_error(site, kwargs, match):

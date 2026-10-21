@@ -40,7 +40,7 @@ Plan 45 minutes of a night and read it back::
 
     row = next(line for line in dispatch_sheet(timeline).splitlines() if "source_scan" in line)
     print(row[:53])
-    #      6  2026-09-11 06:46:28     12.3 min  source_scan
+    #      6  2026-09-11 06:46:50     12.2 min  source_scan
 
 .. figure:: figures/calibration_night.png
    :alt: Gantt chart of the 45-minute calibration night: an opening slew,
@@ -48,8 +48,8 @@ Plan 45 minutes of a night and read it back::
    :width: 100%
 
    The night above as ``plot_timeline_gantt`` draws it: the detector
-   operations before each visit, then each pass after its short
-   ``waiting_for_pass`` idle.
+   operations before each visit, then each pass after the
+   ``waiting_for_pass`` idle that holds its dispatch lead.
 
 The summary carries each body's visits, passes, minutes on source, duty
 cycle and geometry; the sheet has one numbered row per block, and the
@@ -74,14 +74,35 @@ them before dispatching. Every pass dict carries ``az_speed`` and
     print(notes)
     # {'note: confirm the execution layer forwards az_speed, eta_offset_deg'}
 
-Both views are rendered from the timeline's blocks and metadata, so a
-sheet printed from a timeline read back from ECSV is byte-identical.
+Both views are rendered from the timeline's blocks and metadata, and the
+sheet renders every time and duration as the ECSV file stores the block
+times, so a sheet printed from a timeline read back from ECSV is
+byte-identical.
+
+:func:`~fyst_trajectories.overhead.dispatch_records` returns the sheet's
+content as data, one record per visit: its slews, its detector operations
+in execution order and each pass with its ``scan_params`` dict,
+``scheduled_t0_unix`` and slack (the wait in front of it); the night's
+other idle periods are listed apart. Every value is a JSON type, so
+``json.dumps(record)`` writes it, and, as with the sheet, a night read
+back from ECSV gives the same record. A pass's
+``scheduled_t0_unix`` is the instant the planner's search for it began,
+before the pass starts::
+
+    from fyst_trajectories.overhead import dispatch_records
+
+    record = dispatch_records(timeline)
+    visit = record["visits"][0]
+    print(len(record["visits"]), [op["operation"] for op in visit["detector_operations"]])
+    # 2 ['find_detectors', 'skydip', 'retune']
+    first_pass = visit["passes"][0]
+    print(first_pass["t_start_utc"], f"{first_pass['scheduled_t0_unix']:.3f}")
+    # 2026-09-11 06:46:50 1789109178.888
 
 For complete runnable scripts, see ``examples/planet_night.py`` (a night
 with its summary, dispatch sheet, ECSV and figures),
 ``examples/planet_night_visits.py`` (the night read back from its ECSV and
-written as one JSON record per visit: the slews, the detector operations
-in order, and each pass's ``scan_params`` and ``scheduled_t0_unix``) and
+written as JSON by ``dispatch_records``) and
 ``examples/planet_speed_sweep.py`` (a scripted speed sweep on one body)
 in the repository.
 
@@ -132,16 +153,18 @@ crossing unless the policy applies the table's reference or a visit
 overrides it. The policy also holds the observing floor (30°), the
 longest crossing accepted (20 min), the footprint and the on-sky margin
 around it (``footprint_margin``, which a rebuild has to re-apply to land
-on the same crossing), the idle tick and the retry interval, and the tuning policy
-for the detector operations. The quintic turnaround peaks at 1.5 times
+on the same crossing), the dispatch lead reserved before every pass
+(``dispatch_lead_seconds``, 20 s; see Lateness below), the idle tick and
+the retry interval, and the tuning policy for the detector operations.
+The quintic turnaround peaks at 1.5 times
 the nominal acceleration, so the default 1.0 deg/s² peaks at the site's
 1.5 deg/s² advisory ceiling and a default night records no acceleration
 advisory. The first pass of the night above sweeps 2.72°, one module width
-over the cosine of its 61.5° elevation::
+over the cosine of its 61.4° elevation::
 
     first = next(b for b in timeline.blocks if b.scan_type == "planet_cal")
     print(f"{first.metadata['applied']['az_throw']:.2f} {first.elevation:.1f}")
-    # 2.72 61.5
+    # 2.72 61.4
     print(any("acceleration" in w for w in summary.warnings))
     # False
 
@@ -201,7 +224,7 @@ never from a clock, so a night planned twice is identical::
 
     candidates = list_candidates(state, ctx)
     print([(c.body, c.available, round(c.el_bore_estimate, 1)) for c in candidates])
-    # [('saturn', True, 62.2), ('uranus', True, 31.3)]
+    # [('saturn', True, 62.1), ('uranus', True, 31.3)]
 
     plan = plan_visit(state, ctx, "saturn", ScanOverrides(az_speed=1.0))
     print(plan.feasible, plan.transition.path, [b.scan_type for b in plan.blocks])
@@ -209,7 +232,7 @@ never from a clock, so a night planned twice is identical::
 
     state = commit_visit(state, plan)
     print(round((state.t - ctx.start_time).to_value("s") / 60.0, 1))
-    # 28.7
+    # 29.1
 
 An infeasible visit is returned, never raised: ``plan.reason`` names why
 (the kernel could not plan the anchor, below or above the band, the
@@ -225,7 +248,14 @@ a slew named ``sun_escape`` leads the blocks and the pass records the
 pose it escaped to). The night's first ``retune`` block stands for the
 detector-finding operation, named in ``metadata["operation"]``, and a
 skydip is reserved whenever the calibration policy's cadence says one is
-due.
+due. With ``TuningPolicy(skydip_after_retune=True)`` a skydip is also
+reserved immediately after each visit's retune, at the same pose, the
+placement the instrument team asked for. The dispatch lead then follows
+that skydip, and the cadence counts from it as from any skydip, so the
+skydip before the retune falls due again only once the cadence has elapsed
+since the last one. An operation whose duration is zero is not scheduled
+at all: a night planned with
+``overhead_model=OverheadModel(skydip_duration=0)`` holds no skydip.
 
 What a Pass Block Carries
 -------------------------
@@ -270,18 +300,47 @@ than recorded::
 Lateness
 --------
 
-A pass can absorb only the slack the plan left in front of it: the
-``waiting_for_pass`` idle that runs from the end of the detector operations
-to ``t0_scan``. The kernel's anchor lead sets that idle, so it is usually
-tens of seconds; the sheet prints the figure on each pass row, and the idle
-itself is a row of its own, so read the night's own number there rather than
-assuming a fixed one. Once ``t0_scan`` has passed the crossing has opened
-without the telescope on it, and re-planning the recorded dict from a later
-anchor raises
-:class:`~fyst_trajectories.exceptions.TargetNotObservableError` rather than
-returning a shifted pass: re-plan the next block from now with
-``plan_visit`` on a state whose time is the actual time and whose
-``cal_state`` records the detector operations already done, because
+The execution layer's source-scan task (PCS) takes a pass's dict with a
+``scheduled_t0_unix``, floors its start to ``SCAN_DISPATCH_BUFFER_SEC``
+after the dispatch (10 s at the revision this library is checked against)
+and searches for the pass from the later of the two. The sheet therefore
+prints as ``scheduled_t0_unix`` the instant the planner's own search
+began, the block's ``search_start``, not the pass start: dispatched at
+least the buffer before that instant, the task repeats the planner's
+search and builds the planned pass (the keys the sheet's note names
+aside); dispatched later, it searches from its own floor, which finds the
+same crossing to within some tens of milliseconds, until that floor
+passes the pass start, where the source has entered the footprint and the
+task refuses the pass with
+:class:`~fyst_trajectories.exceptions.TargetNotObservableError` rather
+than returning a shifted pass. A later pass of a multi-pass visit records
+the visit's anchor, already past when the pass is dispatched, so the task
+always searches for it from its own floor. The task also refuses a pass
+whose start is more than ``MAX_DISPATCH_DELAY_SEC`` (1800 s) after the
+dispatch, and after its own slew it moves a built pass's start by up to
+``MAX_REFLOOR_DRIFT_SEC`` (30 s) before refusing that too. Nothing
+re-plans a pass automatically.
+
+The plan reserves ``dispatch_lead_seconds`` (20 s by default) between the
+end of the detector operations and each pass, so the ``waiting_for_pass``
+idle in front of a pass is never shorter than the lead, and the sheet's
+header states the figure. The search start the sheet prints sits the lead
+after the operations to within about a second for a single pass of the
+centre module (a multi-pass visit or a ring module by a little more): the
+estimate it is placed from prices the slew to where the body will be at
+that instant and adds the settle, and only the pass's own start pose, the
+edge of its sweep at the solved boresight elevation, is unknown to it. So
+a dispatch up to the lead minus the buffer after the operations, about
+10 s at the defaults, repeats the planner's search, and the pass itself
+starts the kernel's own offset from the search start later still. A later
+pass of a multi-pass visit is
+kept only when it starts at least the step to it plus the lead after the
+previous kept pass ends, and the slack on every pass row is its whole
+wait. A pass that misses its window is skipped, and the next visit keeps
+its times.
+Re-planning from the actual time is the operator's option: ``plan_visit``
+on a state whose time is the actual time and whose ``cal_state`` records
+the detector operations already done, because
 :meth:`~fyst_trajectories.overhead.NightState.initial` records none and a
 fresh state reserves the detector-finding operation and a skydip again.
 
@@ -295,10 +354,15 @@ in the script. The replay credits every block as recorded, so it assumes the
 night ran as planned up to that time. The record names the Sun predicates
 without holding them, so a night planned on another model is resumed with
 that model passed in again; a predicate that does not match the record is
-refused, as is a site whose axis limits differ from those the night was
-planned on. A record written before the policy had ``use_table_throw`` is
-read with it set, since that night swept the table's throw. Here the first
-pass's crossing opened a minute before the operator was ready::
+refused, and so is a site whose axis limits differ from those the night was
+planned on. The ECSV header holds the limits; a file written without them
+reads back with the FYST limits, so a night planned on other limits resumes
+from such a file with its site passed in. A record written before the
+policy had ``use_table_throw`` is
+read with it set, since that night swept the table's throw, and one
+written before it had ``dispatch_lead_seconds`` with that at zero, since
+that night reserved nothing. Here the first pass's crossing opened a
+minute before the operator was ready::
 
     from astropy.time import TimeDelta
 

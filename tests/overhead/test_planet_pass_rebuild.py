@@ -23,6 +23,7 @@ import pytest
 from astropy.time import Time, TimeDelta
 
 from fyst_trajectories import get_fyst_site
+from fyst_trajectories.exceptions import PointingWarning
 from fyst_trajectories.overhead import (
     CalibrationNightPolicy,
     CalibrationPolicy,
@@ -80,8 +81,17 @@ def _planned_pass(block, captured):
 
 
 def _rebuild(timeline):
+    # A rebuild runs the kernel again, so a pass above about 60 deg meets the speed
+    # advisory, and a dwell shorter than its crossing meets the partial-pass one.
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+        warnings.filterwarnings(
+            "ignore",
+            message="High elevation reduces on-sky azimuth speed",
+            category=PointingWarning,
+        )
+        warnings.filterwarnings(
+            "ignore", message=r"dwell=\S+ s is shorter than the", category=PointingWarning
+        )
         pairs = schedule_to_trajectories(timeline, science_only=False)
     return [(b, sb) for b, sb in pairs if b.scan_type == "planet_cal"]
 
@@ -126,7 +136,9 @@ _DWELL_300 = {"default": ScanParameterTable((ElevationBin(30.0, 80.0, 3.0, 300.0
 # whether the blocks without ``search_start`` miss a pass).
 _NIGHTS = {
     "c": (*_PAGE_NIGHT, {}, (), False),
-    "i1": (*_PAGE_NIGHT, {"policy": CalibrationNightPolicy(footprint="i1")}, (), True),
+    # Saturn twice: setting, the i1 cover leads the boresight, so el_bore is
+    # anchored on Saturn, which crosses it less than 300 s before each pass.
+    "i1": (*_PAGE_NIGHT, {"policy": CalibrationNightPolicy(footprint="i1")}, (), False),
     "i3": (*_PAGE_NIGHT, {"policy": CalibrationNightPolicy(footprint="i3")}, (), True),
     "i6": (*_PAGE_NIGHT, {"policy": CalibrationNightPolicy(footprint="i6")}, (), True),
     # A later pass of the first visit crosses its boresight elevation more
@@ -190,9 +202,7 @@ _NIGHTS = {
 @pytest.mark.parametrize("case", list(_NIGHTS))
 def test_every_calibration_night_pass_rebuilds_as_planned(case, captured, tmp_path):
     targets, start, end, kwargs, keys, old_rule_misses = _NIGHTS[case]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        timeline = plan_calibration_night(targets, get_fyst_site(), start, end, **kwargs)
+    timeline = plan_calibration_night(targets, get_fyst_site(), start, end, **kwargs)
     passes = _assert_every_pass_rebuilds_as_planned(timeline, captured, tmp_path, old_rule_misses)
     for key in keys:
         assert any(key in b.metadata["scan_params"] for b in passes), key
@@ -249,8 +259,14 @@ def _scheduler_calibration(footprint, anchor):
         ),
         scan_counter=0,
     )
+    # The scheduler plans its passes with the kernel, uncaptured, so a pass above
+    # about 60 deg meets the speed advisory here too.
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+        warnings.filterwarnings(
+            "ignore",
+            message="High elevation reduces on-sky azimuth speed",
+            category=PointingWarning,
+        )
         blocks = CalibrationPhase().run(state, ctx).blocks
     return ObservingTimeline(
         blocks=list(blocks),
@@ -287,24 +303,23 @@ def _given_in(iso, scale):
 
 @pytest.mark.parametrize("scale", _SCALES)
 def test_a_night_given_in_another_scale_rebuilds_as_planned(scale, captured, tmp_path):
-    """The ``i1`` page night with its window ends given in ``scale`` rebuilds bit for bit.
+    """The ``i6`` page night with its window ends given in ``scale`` rebuilds bit for bit.
 
     The planner holds every time in UTC, so each pass block records the UTC
     instant its search began at and its UTC start as ``t0_scan``, which the
-    capture matches on.
+    capture matches on. The blocks without ``search_start`` miss the night's
+    passes, so the recorded instant is what places each rebuilt pass.
     """
-    targets, start, end = _PAGE_NIGHT
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        timeline = plan_calibration_night(
-            targets,
-            get_fyst_site(),
-            _given_in(start, scale),
-            _given_in(end, scale),
-            policy=CalibrationNightPolicy(footprint="i1"),
-        )
+    targets, start, end, kwargs, _, old_rule_misses = _NIGHTS["i6"]
+    timeline = plan_calibration_night(
+        targets,
+        get_fyst_site(),
+        _given_in(start, scale),
+        _given_in(end, scale),
+        **kwargs,
+    )
     assert timeline.start_time.scale == "utc"
-    _assert_every_pass_rebuilds_as_planned(timeline, captured, tmp_path, True)
+    _assert_every_pass_rebuilds_as_planned(timeline, captured, tmp_path, old_rule_misses)
 
 
 @pytest.mark.parametrize("scale", _SCALES)

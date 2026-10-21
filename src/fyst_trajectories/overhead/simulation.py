@@ -6,6 +6,7 @@ functions to generate actual trajectories and accumulate coverage maps.
 
 import dataclasses
 import logging
+import warnings
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import TypedDict, cast
@@ -15,6 +16,7 @@ from astropy import units as u
 from astropy.time import Time, TimeDelta
 
 from ..coordinates import Coordinates
+from ..exceptions import PointingWarning
 from ..planning import (
     FieldRegion,
     ScanBlock,
@@ -23,6 +25,10 @@ from ..planning import (
     plan_pong_scan,
     plan_source_ces,
 )
+
+# A rebuilt constant-elevation slice is screened against the Sun with the
+# check the AltAz planners run on their built blocks.
+from ..planning._sun_safety import _check_trajectory_sun_safety
 from ..planning.footprints import inflate_footprint, offset_footprint_eta, resolve_footprint
 from ..site import Site
 from ..trajectory import Trajectory
@@ -158,11 +164,21 @@ def schedule_to_trajectories(
         full solved pass. Calibration passes are one block per pass
         and are returned whole.
 
+    Warns
+    -----
+    PointingWarning
+        The planners' advisories for the rebuilt blocks. A
+        constant-elevation block's Sun advisory describes the block's own
+        slice: the slice is screened at every sample against the site's
+        exclusion radius, and the planner's checks of the field centre at
+        the visit's start and of the whole crossing pass are not raised.
+
     Notes
     -----
     Blocks that attempt reconstruction but fail are logged at ``WARNING``
-    and skipped, so one bad block does not abort the whole timeline. This
-    subpackage's own refusals are
+    and skipped, so one bad block does not abort the whole timeline; the
+    line names a pass block's ``search_start``. This subpackage's own
+    refusals are
     :class:`~fyst_trajectories.overhead.ScanParamsSchemaError` (recorded
     metadata that does not match the rebuild's schema) and
     :class:`~fyst_trajectories.overhead.BlockNotReconstructableError` (a
@@ -202,10 +218,15 @@ def schedule_to_trajectories(
             # validation, and a truncated dict as ``KeyError``/``TypeError``
             # from astropy. A rebuild is best-effort, so every one of those
             # skips the block with a log line instead of failing the batch.
+            # A pass block's line names the search_start its rebuild repeated,
+            # which the planner's own refusal of that search does not.
+            meta = sblock.metadata
+            record = f" (search_start={meta['search_start']!r})" if "search_start" in meta else ""
             logger.warning(
-                "Failed to generate trajectory for block '%s' at %s: %s",
+                "Failed to generate trajectory for block '%s' at %s%s: %s",
                 sblock.patch_name,
                 sblock.t_start.iso,
+                record,
                 exc,
             )
 
@@ -234,6 +255,14 @@ def _generate_trajectory_for_block(
         ``trajectory.start_time`` describe the slice while
         ``computed_params`` and ``summary`` describe the full solved
         pass.
+
+    Warns
+    -----
+    PointingWarning
+        The planner's advisories for the rebuilt block. A
+        constant-elevation slice is screened against the Sun over its own
+        samples, in place of the planner's checks of the anchor and the
+        whole pass, which can name an instant outside the block.
 
     Raises
     ------
@@ -336,16 +365,31 @@ def _generate_trajectory_for_block(
             for key in ("az_accel", "timestep", "az_padding")
             if key in ce_params
         }
-        scan_block = plan_constant_el_scan(
-            field=field,
-            elevation=sblock.elevation,
-            velocity=velocity,
+        # The planner's Sun checks describe the field centre at the anchor
+        # and the whole crossing pass, while this block is one slice of
+        # that pass; they are set aside and the slice is screened over its
+        # own window instead, so the advisory names an instant inside it.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="EXCLUSION ZONE: ", category=PointingWarning)
+            scan_block = plan_constant_el_scan(
+                field=field,
+                elevation=sblock.elevation,
+                velocity=velocity,
+                site=site,
+                start_time=anchor,
+                rising=None if lsa_window is not None else sblock.rising,
+                lsa_window=lsa_window,
+                **ce_overrides,
+            )
+        scan_block = _slice_to_block_window(scan_block, sblock)
+        _check_trajectory_sun_safety(
             site=site,
-            start_time=anchor,
-            rising=None if lsa_window is not None else sblock.rising,
-            lsa_window=lsa_window,
-            **ce_overrides,
+            trajectory=scan_block.trajectory,
+            scan_label=(
+                f"constant-elevation scan at RA={field.ra_center:.3f}, Dec={field.dec_center:.3f}"
+            ),
         )
+        return scan_block
     elif sblock.scan_type == "pong":
         pong_params = cast(PongScanParams, scan_params)
         # The pattern the scheduler sized the block by: the recorded keys

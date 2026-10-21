@@ -605,8 +605,9 @@ _PROVENANCE_ONLY = frozenset(
 # keys it forwards and drops the rest without a message. Each is part of the
 # outbound ask to have them forwarded; move a key out of this set only when a
 # re-pinned snapshot shows it forwarded, and then out of the calibration-night
-# dispatch sheet's copy (overhead/calibration_night/reporting.py, held equal to
-# this set below) and the list on docs/overhead_calibration_night.rst.
+# copy that the dispatch sheet and dispatch_records read
+# (overhead/calibration_night/reporting.py, held equal to this set below) and
+# the list on docs/overhead_calibration_night.rst.
 _AWAITING_FORWARD = frozenset(
     {
         "eta_offset_deg",  # per-pass focal-plane row shift
@@ -626,10 +627,10 @@ def test_emitted_source_ces_keys_partition_against_the_execution_layer_pin():
     """Every emitted key is forwarded, provenance-only, or explicitly awaiting.
 
     The calibration-night dispatch sheet names, under each pass row, the
-    awaiting keys that row's dict carries; the simulator cannot import from
-    tests, so it keeps its own copy of the set, held equal to this one here
-    (and ``examples/planet_night_visits.py`` keeps a third, held equal to the
-    sheet's by its own test).
+    awaiting keys that row's dict carries, and ``dispatch_records`` lists
+    them on each pass record; the simulator cannot import from tests, so it
+    keeps its own copy of the set, which both read, held equal to this one
+    here.
 
     The snapshot is re-cut only on a deliberate re-pin of the execution layer
     (see tests/data/README.md). A failure here means a key changed class:

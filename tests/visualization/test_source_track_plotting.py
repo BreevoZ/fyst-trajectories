@@ -5,7 +5,6 @@ test in test_plotting.py covers this module too.
 """
 
 import dataclasses
-import warnings
 
 import numpy as np
 import pytest
@@ -33,33 +32,29 @@ from fyst_trajectories.visualization import plot_source_track  # noqa: E402
 def jupiter_pass():
     """One single-module Jupiter-rising pass on the 2026-03-15 night."""
     site = get_fyst_site()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        block = plan_source_ces(
-            body="jupiter",
-            footprint="c",
-            el_bore=35.0,
-            night=Time("2026-03-15T00:00:00", scale="utc"),
-            mode="rising",
-            site=site,
-        )
+    block = plan_source_ces(
+        body="jupiter",
+        footprint="c",
+        el_bore=35.0,
+        night=Time("2026-03-15T00:00:00", scale="utc"),
+        mode="rising",
+        site=site,
+    )
     return site, block
 
 
 @pytest.fixture(scope="module")
 def fixed_source_pass():
     """One single-module rising pass of a fixed RA/Dec source on the same night."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        return plan_source_ces(
-            ra=83.82,
-            dec=-5.39,
-            footprint="c",
-            el_bore=40.0,
-            night=Time("2026-03-15T00:00:00", scale="utc"),
-            mode="rising",
-            site=get_fyst_site(),
-        )
+    return plan_source_ces(
+        ra=83.82,
+        dec=-5.39,
+        footprint="c",
+        el_bore=40.0,
+        night=Time("2026-03-15T00:00:00", scale="utc"),
+        mode="rising",
+        site=get_fyst_site(),
+    )
 
 
 def _with_metadata(block, **changes):
@@ -130,17 +125,15 @@ class TestPlotSourceTrack:
     def test_rejects_a_non_source_ces_block(self, jupiter_pass):
         site, _ = jupiter_pass
         field = FieldRegion(ra_center=180.0, dec_center=-30.0, width=2.0, height=2.0)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            pong = plan_pong_scan(
-                field=field,
-                velocity=0.5,
-                spacing=0.1,
-                num_terms=4,
-                timestep=0.5,
-                start_time=Time("2026-03-15T01:00:00", scale="utc"),
-                site=site,
-            )
+        pong = plan_pong_scan(
+            field=field,
+            velocity=0.5,
+            spacing=0.1,
+            num_terms=4,
+            timestep=0.5,
+            start_time=Time("2026-03-15T01:00:00", scale="utc"),
+            site=site,
+        )
         with pytest.raises(ValueError, match="plan_source_ces"):
             source_ces_focal_plane_track(pong, site=site)
         with pytest.raises(ValueError, match="plan_source_ces"):

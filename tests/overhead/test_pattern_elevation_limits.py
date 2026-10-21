@@ -19,6 +19,10 @@ that the subscan it books is one the planner builds:
 - the slew's arrival: a setting pattern, a Sun clip or the schedule end that
   closes the window within the slew leaves the telescope where it is, with
   the tick's idle labelled ``unplannable``.
+- the zenith: a pong whose box holds the zenith near transit, where its
+  track winds its azimuth round the zenith and the planner refuses it, is
+  not scanned while the circle about its centre through its corners holds
+  the zenith, and the night idles in place rather than slewing to it.
 """
 
 import logging
@@ -42,6 +46,7 @@ from fyst_trajectories.overhead.scheduler.helpers import (
     _pattern_el_bounds,
     _pong_config,
     _time_inside_el_limits,
+    _transit_offset,
 )
 from fyst_trajectories.patterns import TrajectoryBuilder, compute_pong_period
 from fyst_trajectories.patterns.pong import _pong_peak_offsets
@@ -386,3 +391,196 @@ class TestTheVisitStartsOnArrival:
             state.current_az,
             state.current_el,
         )
+
+
+def _near_zenith_patch(dec):
+    """Build a 4 x 4 deg pong at RA 140, which transits at about 03:16 UTC on 2026-03-01."""
+    return ObservingPatch(
+        name=f"F140{dec:+.0f}",
+        ra_center=140.0,
+        dec_center=dec,
+        width=4.0,
+        height=4.0,
+        scan_type="pong",
+        velocity=0.5,
+    )
+
+
+# At Dec -23 the centre transits just short of the zenith, well inside the
+# circle through the box's corners.
+_THROUGH_ZENITH = _near_zenith_patch(-23.0)
+_TRANSIT = Time("2026-03-01T03:16:00", scale="utc")
+
+
+class TestZenithKeepOut:
+    """A pattern whose circle holds the zenith is not scanned, and is not slewed to.
+
+    A pong's track passing round the zenith winds its azimuth through whole
+    turns, past the azimuth limits, so the planner refuses it; the elevation
+    limits cannot see that. The circle about the field centre through the
+    pong's corners, or at the daisy's reach, has to exclude the zenith, with
+    no margin.
+    """
+
+    def test_a_box_holding_the_zenith_gets_nothing(self, coordinates, site):
+        lowest, highest = _pattern_el_bounds(
+            _THROUGH_ZENITH, _TRANSIT + TimeDelta([0.0], format="sec"), coordinates
+        )
+        assert lowest[0] > site.telescope_limits.elevation.min + 60.0
+        assert highest[0] > 90.0
+        assert _time_inside_el_limits(_THROUGH_ZENITH, _TRANSIT, 3600.0, coordinates) == 0.0
+
+    def test_the_window_closes_where_the_circle_reaches_the_zenith(self, coordinates):
+        start = Time("2026-03-01T02:30:00", scale="utc")
+        window = _time_inside_el_limits(_THROUGH_ZENITH, start, 3600.0, coordinates)
+        assert 0.0 < window < 3600.0
+        _, highest = _pattern_el_bounds(
+            _THROUGH_ZENITH, start + TimeDelta([window, window + 1.0], format="sec"), coordinates
+        )
+        # The window ends at the last instant verified clear; the circle reaches
+        # the zenith within a second after it.
+        assert highest[0] < 90.0 <= highest[1]
+
+    def test_a_circle_short_of_the_zenith_keeps_its_window(self, coordinates):
+        """At Dec -26 the circle tops out 0.3 deg short of the zenith and scans through transit."""
+        patch = _near_zenith_patch(-26.0)
+        start = _TRANSIT - TimeDelta(1800.0, format="sec")
+        offsets = np.linspace(0.0, 3600.0, 121)
+        _, highest = _pattern_el_bounds(
+            patch, start + TimeDelta(offsets, format="sec"), coordinates
+        )
+        assert 89.6 < float(np.max(highest)) < 90.0
+        assert _time_inside_el_limits(patch, start, 3600.0, coordinates) == 3600.0
+
+    def test_a_hold_between_two_samples_ends_the_window_before_it(self, coordinates):
+        """At Dec -25.64 the circle holds the zenith for 228 s, less than the 300 s step.
+
+        From a start whose samples fall 36 s before the hold and 36 s after
+        it, the window still ends where the circle reaches the zenith,
+        because the centre's transit, where the circle peaks, is sampled too.
+        """
+        patch = _near_zenith_patch(-25.64)
+        fine = np.arange(-600.0, 600.0, 1.0)
+        _, highest = _pattern_el_bounds(
+            patch, _TRANSIT + TimeDelta(fine, format="sec"), coordinates
+        )
+        held = fine[highest >= 90.0]
+        assert held[-1] - held[0] + 1.0 == 228.0
+        start = _TRANSIT + TimeDelta(held[0] - 1236.0, format="sec")
+        steps = np.linspace(0.0, 3600.0, 13)
+        _, sampled = _pattern_el_bounds(patch, start + TimeDelta(steps, format="sec"), coordinates)
+        assert np.all(sampled < 90.0)
+
+        window = _time_inside_el_limits(patch, start, 3600.0, coordinates)
+        assert 0.0 < window < 1236.0
+        _, highest = _pattern_el_bounds(
+            patch, start + TimeDelta([window, window + 1.0], format="sec"), coordinates
+        )
+        assert highest[0] < 90.0 <= highest[1]
+
+    def test_the_sampled_transit_is_where_the_circle_peaks(self, coordinates):
+        """The centre's transit lands within 1 s of the circle's top, found on a 0.01 s grid.
+
+        The grid spans 5 s either side of the transit, so a transit more
+        than a second off finds the top more than a second from it, at the
+        true peak or at the grid's edge.
+        """
+        patch = _near_zenith_patch(-25.64)
+        start = _TRANSIT - TimeDelta(1800.0, format="sec")
+        transit = _transit_offset(patch, start, coordinates)
+        fine = transit + np.arange(-5.0, 5.0, 0.01)
+        _, highest = _pattern_el_bounds(patch, start + TimeDelta(fine, format="sec"), coordinates)
+        assert abs(fine[np.argmax(highest)] - transit) < 1.0
+
+    def test_a_daisy_hold_between_two_samples_ends_the_window_before_it(self, coordinates):
+        """At Dec -23.9 a daisy's circle holds the zenith for 183 s, less than the 300 s step.
+
+        From a start whose samples fall 58 s before the hold and 59 s after
+        it, the window still ends where the circle reaches the zenith,
+        because the centre's transit, where the circle peaks, is sampled too.
+        """
+        patch = ObservingPatch(
+            name="daisy",
+            ra_center=140.0,
+            dec_center=-23.9,
+            width=1.0,
+            height=1.0,
+            scan_type="daisy",
+            velocity=0.3,
+            scan_params={"radius": 0.3},
+        )
+        fine = np.arange(-600.0, 600.0, 1.0)
+        _, highest = _pattern_el_bounds(
+            patch, _TRANSIT + TimeDelta(fine, format="sec"), coordinates
+        )
+        held = fine[highest >= 90.0]
+        assert held[-1] - held[0] + 1.0 == 183.0
+        start = _TRANSIT + TimeDelta(held[0] - 1258.0, format="sec")
+        steps = np.linspace(0.0, 3600.0, 13)
+        _, sampled = _pattern_el_bounds(patch, start + TimeDelta(steps, format="sec"), coordinates)
+        assert np.all(sampled < 90.0)
+
+        window = _time_inside_el_limits(patch, start, 3600.0, coordinates)
+        assert 0.0 < window < 1258.0
+        _, highest = _pattern_el_bounds(
+            patch, start + TimeDelta([window, window + 1.0], format="sec"), coordinates
+        )
+        assert highest[0] < 90.0 <= highest[1]
+
+    def test_a_daisy_short_of_the_zenith_keeps_its_window(self, coordinates):
+        """The same field as a daisy: its circle tops out at 88.3 deg and scans through transit."""
+        patch = ObservingPatch(
+            name="daisy",
+            ra_center=140.0,
+            dec_center=-25.64,
+            width=1.0,
+            height=1.0,
+            scan_type="daisy",
+            velocity=0.3,
+            scan_params={"radius": 0.3},
+        )
+        start = _TRANSIT - TimeDelta(1800.0, format="sec")
+        offsets = np.linspace(0.0, 3600.0, 3601)
+        _, highest = _pattern_el_bounds(
+            patch, start + TimeDelta(offsets, format="sec"), coordinates
+        )
+        assert 88.0 < float(np.max(highest)) < 88.5
+        assert _time_inside_el_limits(patch, start, 3600.0, coordinates) == 3600.0
+
+    def test_the_night_idles_in_place_while_the_circle_holds_the_zenith(self, site, coordinates):
+        """No slew to the patch ends in an idle tick, and every scan keeps the zenith out.
+
+        A bound clamped at 90 deg would scan through the approach to transit
+        and then slew to the patch only to idle ``unplannable``, the planner
+        refusing the subscan's azimuth.
+        """
+        timeline = generate_timeline(
+            patches=[_THROUGH_ZENITH],
+            site=site,
+            start_time="2026-03-01T02:00:00",
+            end_time="2026-03-01T04:30:00",
+        )
+        blocks = timeline.blocks
+
+        assert timeline.science_blocks
+        assert not [b for b in blocks if b.metadata.get("reason") == "unplannable"]
+        for before, after in zip(blocks, blocks[1:]):
+            if str(before.block_type) == "slew":
+                assert str(after.block_type) != "idle"
+            if str(after.block_type) == "idle":
+                assert after.az_start == after.az_end == pytest.approx(before.end_pose_az)
+                assert after.elevation == pytest.approx(before.elevation)
+        for block in timeline.science_blocks:
+            offsets = np.linspace(0.0, block.duration, 31)
+            _, highest = _pattern_el_bounds(
+                _THROUGH_ZENITH, block.t_start + TimeDelta(offsets, format="sec"), coordinates
+            )
+            assert np.all(highest < 90.0), block.t_start.isot
+
+        # While the circle holds the zenith the telescope waits where it is.
+        offsets = np.arange(0.0, 9000.0, 30.0)
+        _, highest = _pattern_el_bounds(
+            _THROUGH_ZENITH, timeline.start_time + TimeDelta(offsets, format="sec"), coordinates
+        )
+        held = timeline.start_time + TimeDelta(offsets[highest >= 90.0], format="sec")
+        assert any(str(b.block_type) == "idle" and held[0] <= b.t_start <= held[-1] for b in blocks)

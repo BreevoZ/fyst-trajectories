@@ -537,9 +537,13 @@ setting direction from the source's elevation slope there::
     print(f"mode={cp['mode']}  el_bore={cp['el_bore']:.2f}  start={cp['t0_iso'][:19]}")
 
 The resolved start typically lands within about a minute after
-``start_time`` and never before it. Supplying ``el_bore`` alongside instead
-forward-searches from the anchor for that elevation. An anchor near transit
-is rejected with
+``start_time`` and never before it. On a footprint whose cover lies beyond
+the boresight along the source's motion (above it while the source rises,
+below it while it sets, as an inner-ring module's can), ``el_bore`` is
+derived just ahead of the source's elevation at the anchor, and the pass
+starts when the source reaches the cover, minutes after the anchor for an
+inner-ring module. Supplying ``el_bore`` alongside instead forward-searches
+from the anchor for that elevation. An anchor near transit is rejected with
 :class:`~fyst_trajectories.exceptions.TargetNotObservableError`, the
 elevation-crossing inversion being ill-conditioned there; anchor away from
 transit or pass ``el_bore``.
@@ -594,7 +598,8 @@ step, since focal-plane rotation mixes the azimuth throw into eta, so
 successive passes interleave rather than painting disjoint bands. The
 ``el_step`` knob (default: the footprint eta extent) sets how far
 ``el_bore`` moves between passes; below the extent the passes pack closer,
-their source windows overlap in time, and the planner warns. Each block
+and sufficiently below it their source windows overlap in time, which the
+planner warns of. Each block
 carries its ``pass_index``, ``pass_eta_offset_deg`` and
 ``pass_el_bore_deg`` in ``trajectory.metadata.pattern_params``, beside the
 ``body`` every source-CES block records there (the lower-case body name, or
@@ -630,8 +635,8 @@ section (reusing its ``modules``, ``site`` and ``Time``), scalars only::
     print(f"az_start={params['az_start']:.2f}  az_throw={params['az_throw']:.2f}")
     print(f"v_az={params['v_az']:+.5f} deg/s  el_bore={params['el_bore']:.2f}")
 
-The returned dict is identical to ``plan_source_ces(...).computed_params``
-for the same inputs.
+The returned dict equals ``plan_source_ces(...).computed_params`` for the
+same inputs; the block's copy is read-only.
 
 Shared Parameters: Sun Safety and Refraction
 --------------------------------------------

@@ -1,7 +1,8 @@
 """Regression anchors for planned calibration nights.
 
 The fast anchor is a one-hour two-body night on 2026-09-11 (Saturn near
-transit with Uranus rising); the full four-body night from dusk to dawn
+transit with Uranus rising), planned as the defaults have it and again with
+a skydip after every retune; the full four-body night from dusk to dawn
 runs under ``--run-slow``. Counts and causes are anchored exactly, geometry
 tolerantly. Every value was re-run, not derived.
 """
@@ -12,6 +13,7 @@ import pytest
 from astropy.time import Time
 
 from fyst_trajectories import choose_encoder_solution, get_fyst_site
+from fyst_trajectories.exceptions import PointingWarning
 from fyst_trajectories.overhead import (
     NightContext,
     NightState,
@@ -26,19 +28,30 @@ from fyst_trajectories.sun_models import make_sun_safe
 
 def _plan(targets, start, end):
     site = get_fyst_site()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        return site, plan_calibration_night(targets, site, start, end)
+    return site, plan_calibration_night(targets, site, start, end)
 
 
 def _passes(timeline):
     return [b for b in timeline.blocks if b.scan_type == "planet_cal"]
 
 
+def _operations(timeline):
+    """Return the detector operations in time order, the detector find by its own name."""
+    return [
+        b.metadata.get("operation", b.scan_type)
+        for b in timeline.blocks
+        if b.scan_type in ("retune", "skydip")
+    ]
+
+
 def _check_rebuild_and_regate(site, timeline):
     """Every pass rebuilds from its relative dict and its wrap clears the Sun gate."""
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+        warnings.filterwarnings(
+            "ignore",
+            message="High elevation reduces on-sky azimuth speed",
+            category=PointingWarning,
+        )
         pairs = schedule_to_trajectories(timeline, science_only=False)
     passes = _passes(timeline)
     assert len(pairs) == len(passes)
@@ -82,13 +95,19 @@ class TestShortNight:
         assert kinds.count("idle") == 4
         assert timeline.validate() == []
 
+    def test_operations_in_order(self, short_night):
+        """No skydip follows a retune: the one skydip is the cadence's, due at the first visit."""
+        _, timeline = short_night
+        assert _operations(timeline) == ["find_detectors", "skydip", "retune", "retune", "retune"]
+
     def test_visit_order_and_causes(self, short_night):
         _, timeline = short_night
         assert [b.metadata["target"] for b in _passes(timeline)] == ["saturn"] * 3
         meta = read_calibration_night_metadata(timeline)
         assert meta["drops"] == []
-        assert {d["reason"] for d in meta["deferrals"]} == {"window_closed"}
-        assert {d["body"] for d in meta["deferrals"]} == {"saturn", "uranus"}
+        # The third pass ends 54 s before the night, under min_pass_seconds,
+        # so the loop ends there without asking either body again.
+        assert meta["deferrals"] == []
 
     def test_one_retune_per_pass_at_the_target_pose(self, short_night):
         _, timeline = short_night
@@ -129,6 +148,40 @@ class TestShortNight:
     def test_rebuilds_and_regates(self, short_night):
         site, timeline = short_night
         _check_rebuild_and_regate(site, timeline)
+
+
+class TestShortNightWithTheDipAfterTheRetune:
+    """The same hour with a skydip after every retune: two Saturn passes instead of three."""
+
+    def test_block_counts(self, short_night_with_dip):
+        _, timeline = short_night_with_dip
+        kinds = [b.scan_type for b in timeline.blocks]
+        assert len(kinds) == 14
+        assert kinds.count("planet_cal") == 2
+        assert kinds.count("slew") == 2
+        assert kinds.count("idle") == 4
+        assert timeline.validate() == []
+
+    def test_operations_in_order(self, short_night_with_dip):
+        """A skydip follows every retune, and the cadence's is due only at the first visit."""
+        _, timeline = short_night_with_dip
+        assert _operations(timeline) == [
+            "find_detectors",
+            "skydip",
+            "retune",
+            "skydip",
+            "retune",
+            "skydip",
+        ]
+
+    def test_totals(self, short_night_with_dip):
+        _, timeline = short_night_with_dip
+        summary = summarize_calibration_night(timeline)
+        saturn, uranus = summary.bodies
+        assert (saturn.visits, saturn.passes, uranus.passes) == (2, 2, 0)
+        assert summary.tuning_minutes == pytest.approx(30.0)
+        assert saturn.minutes_on_source == pytest.approx(20.4, abs=0.5)
+        assert {d["reason"] for d in summary.deferrals} == {"window_closed"}
 
 
 @pytest.fixture(scope="class")

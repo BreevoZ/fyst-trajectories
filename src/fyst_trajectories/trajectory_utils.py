@@ -175,7 +175,11 @@ def validate_trajectory_dynamics(
         azimuth speed is under half its coordinate rate. The numbers quoted
         are those of the fastest sample within 0.001 deg of that highest one.
         A trajectory whose azimuth spans less than 0.001 deg (whole turns
-        aside) does not move in azimuth and gets no such advisory.
+        aside) does not move in azimuth and gets no such advisory. Only the
+        given samples are judged: a trajectory sampled more coarsely than its
+        motion changes (a 1 deg/s azimuth ramp on 1 s steps) can warn on one
+        time grid and not on another of the same motion when the judged
+        samples lie within a few tenths of a degree of 60 deg.
     """
     if not (np.all(np.isfinite(az)) and np.all(np.isfinite(el)) and np.all(np.isfinite(times))):
         raise ValueError("Non-finite values (NaN or Inf) detected in trajectory az/el/times arrays")

@@ -5,8 +5,9 @@ planned as a multi-pass source-CES sequence on the first listed planet that
 is up and clear of the Sun, reached by a SLEW block planned with
 ``plan_transition`` and followed by one CALIBRATION block per pass, instead
 of a single fixed-duration parked block. These tests cover the emit path,
-the acquisition slew, the failure/truncation semantics, and the ECSV
-round-trip of the recorded pass parameters.
+the acquisition slew, the failure, truncation and overlap semantics, where
+the planner's advisories are raised, and the ECSV round-trip of the
+recorded pass parameters.
 
 Jupiter rises over Cerro Chajnantor across roughly 20:00-23:30 UTC on
 2026-03-15 (the date the planning tests use), so the calibration anchors
@@ -22,7 +23,7 @@ import pytest
 from astropy.time import Time, TimeDelta
 
 from fyst_trajectories import get_fyst_site
-from fyst_trajectories.exceptions import TargetNotObservableError
+from fyst_trajectories.exceptions import PointingWarning, TargetNotObservableError
 from fyst_trajectories.overhead import (
     BlockType,
     CalibrationPolicy,
@@ -538,6 +539,34 @@ class TestPlanetCalScanIntegration:
         assert timeline.validate() == []
         assert compute_budget(timeline)["calibration_breakdown"]["planet_cal"]["count"] == 3
 
+    def test_a_pass_advisory_is_raised_by_the_rebuild_not_the_night(self):
+        """Saturn's third pass is planned above 60 deg, where the planner warns.
+
+        The planner's advisory on the slow on-sky azimuth speed describes the
+        pass, which its block records, so it is raised where a science
+        subscan's is: by the rebuild of the finished timeline, not while the
+        timeline is generated.
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", PointingWarning)
+            timeline = generate_timeline(
+                patches=[],
+                site=get_fyst_site(),
+                start_time="2026-09-10T04:22:00",
+                end_time="2026-09-10T05:20:00",
+                calibration_policy=CalibrationPolicy(
+                    planet_cal_scan=True, planet_targets=("saturn",)
+                ),
+            )
+        assert [str(w.message) for w in caught if issubclass(w.category, PointingWarning)] == []
+
+        passes = [b for b in timeline.blocks if b.scan_type == "planet_cal"]
+        assert [b.metadata["scan_params"]["pass_index"] for b in passes] == [0, 1, 2]
+        assert passes[-1].elevation > 60.0
+        with pytest.warns(PointingWarning, match="High elevation reduces on-sky azimuth speed"):
+            pairs = schedule_to_trajectories(timeline, science_only=False)
+        assert len(pairs) == 3
+
 
 class TestPlanetCalScanFlagOff:
     """With the flag off the planet cal stays a single parked block."""
@@ -765,6 +794,64 @@ class TestPlanetCalScanTruncation:
         for block in result.blocks:
             assert block.t_stop.unix <= ctx.end_time.unix
         assert result.state.current_time.unix <= ctx.end_time.unix
+
+
+class TestPlanetCalScanOverlappingPasses:
+    """A pass that starts before the previous kept pass ends is dropped."""
+
+    def test_a_pass_that_opens_before_the_previous_one_closes_is_dropped(self):
+        """At an el_step of 0.3 deg the second pass opens before the first closes.
+
+        Each pass block starts where the previous pass ends, so the second
+        pass would start before its own block. It is dropped, and the third,
+        which opens after the first closes, follows the first.
+        """
+        anchor = Time(_ANCHOR, scale="utc")
+        ctx = _ctx(_scan_policy(planet_cal_el_step=0.3))
+        state = SchedulerState(
+            current_time=anchor,
+            current_az=180.0,
+            current_el=50.0,
+            cal_state=_only_planet_cal_due(anchor),
+            scan_counter=0,
+        )
+
+        passes = _passes(CalibrationPhase().run(state, ctx).blocks)
+
+        assert [b.metadata["scan_params"]["pass_index"] for b in passes] == [0, 2]
+        assert [b.subscan_index for b in passes] == [0, 1]
+        for block in passes:
+            assert block.metadata["scan_params"]["n_passes"] == 3
+            assert Time(block.metadata["t0_scan"], scale="utc").unix >= block.t_start.unix
+
+    def test_a_pass_that_opens_while_the_previous_trajectory_runs_is_dropped(self):
+        """At an el_step of 1.10 deg Saturn's second pass opens inside the first's last leg.
+
+        The second pass opens after the first block ends, at the first
+        pass's ``t1_iso``, but before the first trajectory, quantised to
+        whole legs, ends. It is dropped, and each kept pass opens after the
+        previous kept trajectory ends.
+        """
+        timeline = generate_timeline(
+            patches=[],
+            site=get_fyst_site(),
+            start_time="2026-09-10T04:22:00",
+            end_time="2026-09-10T05:20:00",
+            calibration_policy=CalibrationPolicy(
+                planet_cal_scan=True, planet_targets=("saturn",), planet_cal_el_step=1.10
+            ),
+        )
+        passes = [b for b in timeline.blocks if b.scan_type == "planet_cal"]
+        assert [b.metadata["scan_params"]["pass_index"] for b in passes] == [0, 2]
+
+        # The kept third pass is planned above 60 deg.
+        with pytest.warns(PointingWarning, match="High elevation reduces on-sky azimuth speed"):
+            pairs = schedule_to_trajectories(timeline, science_only=False)
+        rebuilt = [scan.trajectory for block, scan in pairs if block.scan_type == "planet_cal"]
+        assert len(rebuilt) == 2
+        first, second = rebuilt
+        first_end = first.start_time.unix + float(first.times[-1])
+        assert second.start_time.unix >= first_end
 
 
 class TestPlanetCalScanECSVRoundTrip:
@@ -995,20 +1082,18 @@ class TestPlanetCalScanReconstruction:
             overhead_model=ctx.overhead_model,
             calibration_policy=ctx.calibration_policy,
         )
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            pairs = schedule_to_trajectories(timeline, science_only=False)
-            keyless = dataclasses.replace(
-                timeline,
-                blocks=[
-                    dataclasses.replace(
-                        b,
-                        metadata={k: v for k, v in b.metadata.items() if k != "search_start"},
-                    )
-                    for b in blocks
-                ],
-            )
-            refused = schedule_to_trajectories(keyless, science_only=False)
+        pairs = schedule_to_trajectories(timeline, science_only=False)
+        keyless = dataclasses.replace(
+            timeline,
+            blocks=[
+                dataclasses.replace(
+                    b,
+                    metadata={k: v for k, v in b.metadata.items() if k != "search_start"},
+                )
+                for b in blocks
+            ],
+        )
+        refused = schedule_to_trajectories(keyless, science_only=False)
         ((block, scan_block),) = pairs
         assert block.metadata["scan_params"]["footprint"] == "i6"
         _assert_reconstruction_faithful(block, scan_block, ctx.site)
@@ -1067,9 +1152,7 @@ class TestPlanetCalScanReconstruction:
         path = tmp_path / "tt_clock.ecsv"
         write_timeline(timeline, path)
         for source in (timeline, read_timeline(path)):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                pairs = schedule_to_trajectories(source, science_only=False)
+            pairs = schedule_to_trajectories(source, science_only=False)
             assert len(pairs) == 3
             for block, rebuilt in pairs:
                 el_bore = block.metadata["scan_params"]["el_bore"]

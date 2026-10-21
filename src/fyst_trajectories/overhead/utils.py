@@ -30,11 +30,11 @@ def _utc_instant(t: Time | str) -> Time:
     every time this way, so a night is planned on the UTC instants its times
     name, as exactly as astropy converts them (from TT, TAI, TDB and TCG
     exactly, from UT1 and TCB to within a few units in the last place);
-    every time the simulator records is a UTC string to the millisecond, the
-    form its readers parse; and a pass's ``search_start``, which keeps the
-    UTC Julian date alone, restores the very instant the planner searched
-    from (a location on the ``Time`` would enter its conversion to TDB, and
-    so the planned pass).
+    every time the simulator records is a UTC string to the millisecond (in a
+    file with a ``+00:00`` offset), the form its readers parse; and a pass's
+    ``search_start``, which keeps the UTC Julian date alone, restores the very
+    instant the planner searched from (a location on the ``Time`` would enter
+    its conversion to TDB, and so the planned pass).
     """
     if isinstance(t, str):
         return Time(t, scale="utc")

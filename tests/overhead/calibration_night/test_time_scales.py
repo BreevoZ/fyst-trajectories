@@ -11,8 +11,6 @@ as it does, and every pass rebuilds from its block, bit for bit, as it was
 planned.
 """
 
-import warnings
-
 import numpy as np
 import pytest
 from astropy.time import Time
@@ -55,9 +53,8 @@ def given_night(request, short_night):
         planned.extend((kwargs["start_time"], p) for p in passes)
         return passes
 
-    with pytest.MonkeyPatch.context() as patch, warnings.catch_warnings():
+    with pytest.MonkeyPatch.context() as patch:
         patch.setattr(step, "plan_source_ces_passes", recording)
-        warnings.simplefilter("ignore")
         timeline = plan_calibration_night(["saturn", "uranus"], site, given(_START), given(_END))
     return timeline, planned
 
@@ -155,14 +152,16 @@ def test_it_resumes_from_its_file_as_the_utc_night_does(given_night_file, short_
     assert (state.deferred.keys(), state.dropped) == (utc_state.deferred.keys(), utc_state.dropped)
 
 
+@pytest.mark.filterwarnings(
+    "ignore:High elevation reduces on-sky azimuth speed:"
+    "fyst_trajectories.exceptions.PointingWarning"
+)
 @pytest.mark.parametrize("source", ["memory", "file"])
 def test_every_pass_rebuilds_as_planned(given_night, given_night_file, source):
     """The planner searched from a UTC instant, which ``search_start`` restores exactly."""
     timeline, planned = given_night
     rebuilt_from = timeline if source == "memory" else given_night_file[1]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        pairs = schedule_to_trajectories(rebuilt_from, science_only=False)
+    pairs = schedule_to_trajectories(rebuilt_from, science_only=False)
     assert len(pairs) == 3
     for block, rebuilt in pairs:
         anchor, p = _planned_pass(block, planned)

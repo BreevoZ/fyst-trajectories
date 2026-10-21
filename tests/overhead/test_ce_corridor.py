@@ -8,7 +8,8 @@ gate guaranteed. Without that gate a constant-elevation patch scheduled
 across its transit emits rising-half blocks for hours past the crossing
 pass's opening, and ``schedule_to_trajectories`` can rebuild only the
 blocks anchored before it. The gate reads a ``PointingError`` from the solve
-as "no plannable pass" and lets any other error through.
+as "no plannable pass" and lets any other error through, and leaves the
+solve's advisories to the rebuild.
 """
 
 import warnings
@@ -18,7 +19,7 @@ import pytest
 from astropy.time import Time
 
 from fyst_trajectories import Coordinates, get_fyst_site
-from fyst_trajectories.exceptions import PointingError
+from fyst_trajectories.exceptions import PointingError, PointingWarning
 from fyst_trajectories.overhead import (
     BlockType,
     ObservingPatch,
@@ -45,14 +46,12 @@ _AUGUST_PATCH = ObservingPatch(
 @pytest.fixture(scope="module")
 def august_ce_timeline():
     """Build the night this file pins: one CE patch observed across its transit."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        return generate_timeline(
-            patches=[_AUGUST_PATCH],
-            site=get_fyst_site(),
-            start_time="2026-08-01T23:00:00",
-            end_time="2026-08-02T07:00:00",
-        )
+    return generate_timeline(
+        patches=[_AUGUST_PATCH],
+        site=get_fyst_site(),
+        start_time="2026-08-01T23:00:00",
+        end_time="2026-08-02T07:00:00",
+    )
 
 
 def _science(timeline):
@@ -62,9 +61,7 @@ def _science(timeline):
 def test_every_scheduled_ce_block_reconstructs(august_ce_timeline):
     science = _science(august_ce_timeline)
     assert science, "expected science blocks on this night"
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        pairs = schedule_to_trajectories(august_ce_timeline)
+    pairs = schedule_to_trajectories(august_ce_timeline)
     assert len(pairs) == len(science), (
         f"{len(science) - len(pairs)} of {len(science)} scheduled science "
         f"blocks were not reconstructable"
@@ -147,9 +144,7 @@ def test_reconstructs_after_ecsv_round_trip(august_ce_timeline, tmp_path):
     loaded = read_timeline(str(path))
     science = _science(loaded)
     assert all("t0_scan" in b.metadata for b in science)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        pairs = schedule_to_trajectories(loaded)
+    pairs = schedule_to_trajectories(loaded)
     assert len(pairs) == len(science)
 
 
@@ -160,14 +155,12 @@ def test_a_night_given_in_tt_is_the_utc_night_held_in_utc(august_ce_timeline, tm
     UTC night's ``t0_scan``, the file keeps the instants, and every subscan
     rebuilds as the UTC night's does.
     """
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        night = generate_timeline(
-            patches=[_AUGUST_PATCH],
-            site=get_fyst_site(),
-            start_time=Time("2026-08-01T23:00:00", scale="utc").tt,
-            end_time=Time("2026-08-02T07:00:00", scale="utc").tt,
-        )
+    night = generate_timeline(
+        patches=[_AUGUST_PATCH],
+        site=get_fyst_site(),
+        start_time=Time("2026-08-01T23:00:00", scale="utc").tt,
+        end_time=Time("2026-08-02T07:00:00", scale="utc").tt,
+    )
     assert (night.start_time.scale, night.end_time.scale) == ("utc", "utc")
     assert len(night.blocks) == len(august_ce_timeline.blocks)
     for block, utc_block in zip(night.blocks, august_ce_timeline.blocks):
@@ -180,11 +173,9 @@ def test_a_night_given_in_tt_is_the_utc_night_held_in_utc(august_ce_timeline, tm
     loaded = read_timeline(str(path))
     for block, back in zip(night.blocks, loaded.blocks, strict=True):
         assert abs((back.t_start - block.t_start).to_value("s")) <= 5e-4 + 1e-9
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        pairs = schedule_to_trajectories(night)
-        utc_pairs = schedule_to_trajectories(august_ce_timeline)
-        assert len(schedule_to_trajectories(loaded)) == len(_science(loaded))
+    pairs = schedule_to_trajectories(night)
+    utc_pairs = schedule_to_trajectories(august_ce_timeline)
+    assert len(schedule_to_trajectories(loaded)) == len(_science(loaded))
     assert len(pairs) == len(utc_pairs) == len(_science(night))
     for (_, rebuilt), (_, utc_rebuilt) in zip(pairs, utc_pairs):
         assert np.array_equal(rebuilt.trajectory.times, utc_rebuilt.trajectory.times)
@@ -216,6 +207,41 @@ def test_a_patch_beside_a_celestial_pole_is_skipped_not_raised():
     )
     assert timeline.blocks
     assert not _science(timeline)
+
+
+def test_a_pass_advisory_from_the_gate_is_raised_by_the_rebuild_not_the_night():
+    """The crossing solve's advisory on a long pass is left to the rebuild.
+
+    A 110 deg wide field crosses el 50 deg over 8.4 h, which the solve
+    flags as unusually long. The gate runs that solve while the timeline is
+    generated, and the advisory describes the pass the science block
+    records, so it is raised where a science subscan's are: by the rebuild
+    of the finished timeline, which runs the same solve.
+    """
+    wide = ObservingPatch(
+        name="Wide",
+        ra_center=0.0,
+        dec_center=-30.0,
+        width=110.0,
+        height=10.0,
+        scan_type="constant_el",
+        velocity=1.0,
+        elevation=50.0,
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", PointingWarning)
+        timeline = generate_timeline(
+            patches=[wide],
+            site=get_fyst_site(),
+            start_time="2026-06-15T03:00:00",
+            end_time="2026-06-15T04:00:00",
+        )
+    assert [str(w.message) for w in caught if issubclass(w.category, PointingWarning)] == []
+    assert len(_science(timeline)) == 1
+
+    with pytest.warns(PointingWarning, match=r"Computed observation duration 8\.4h is unusually"):
+        pairs = schedule_to_trajectories(timeline)
+    assert len(pairs) == 1
 
 
 class TestCorridorSolveRefusals:

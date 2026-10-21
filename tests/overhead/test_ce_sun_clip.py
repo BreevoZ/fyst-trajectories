@@ -11,16 +11,21 @@ the scan elevation, not only along the field centre. These tests pin:
 - the constant-elevation branch of ``_compute_scan_duration``, which
   refuses a visit whose corridor holds the Sun's azimuth while its field
   centre is clear.
+- the Sun advisory of a rebuilt constant-elevation block, which describes
+  the block's own window rather than the visit's whole crossing pass.
 - (slow) a 24-hour five-patch night whose rebuilt constant-elevation
   science clears the exclusion radius at every sample.
 """
 
+import dataclasses
+import re
 import warnings
 
 import numpy as np
 import pytest
 from astropy.time import Time, TimeDelta
 
+from fyst_trajectories.exceptions import PointingWarning
 from fyst_trajectories.overhead import (
     ObservingPatch,
     OverheadModel,
@@ -36,6 +41,7 @@ from fyst_trajectories.overhead.scheduler.helpers import (
     _span_columns,
     _time_until_sun_unsafe,
 )
+from fyst_trajectories.overhead.simulation import _generate_trajectory_for_block
 
 # Sunrise at the site: the Sun climbs from 3 deg (az ~114) to ~16 deg over
 # the hour, so a span holding its azimuth at el 60 turns unsafe mid-window.
@@ -281,6 +287,41 @@ def test_ce_visit_is_refused_when_its_corridor_meets_the_zone(coordinates, site)
     assert dur == 0.0
 
 
+def test_a_rebuilt_ce_block_is_screened_over_its_own_window(site):
+    """The rebuild's Sun advisory names an instant inside the block, or nothing.
+
+    On this night W4 is booked up to the window's end, clear of the zone,
+    while the crossing pass the rebuild solves runs on more than 2.5 h past
+    the block and its sweep then enters the zone. The booked block rebuilds
+    without an advisory; the same block moved to 10:40-10:50 raises one
+    naming an instant inside its own window.
+    """
+    timeline = generate_timeline(
+        patches=[_W4],
+        site=site,
+        start_time="2026-12-16T08:00:00",
+        end_time="2026-12-16T09:00:00",
+    )
+    (block,) = timeline.science_blocks
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", PointingWarning)
+        ((_, scan),) = schedule_to_trajectories(timeline)
+    assert [str(w.message) for w in caught if issubclass(w.category, PointingWarning)] == []
+    pass_end = Time(scan.computed_params["end_time_iso"], scale="utc")
+    assert (pass_end - block.t_stop).sec > 2.5 * 3600.0
+
+    late = dataclasses.replace(
+        block,
+        t_start=Time("2026-12-16T10:40:00", scale="utc"),
+        t_stop=Time("2026-12-16T10:50:00", scale="utc"),
+    )
+    with pytest.warns(PointingWarning, match="EXCLUSION ZONE: planned constant-elevation") as rec:
+        _generate_trajectory_for_block(late, site)
+    (message,) = [str(w.message) for w in rec]
+    quoted = Time(re.search(r"from the Sun at (\S+ \S+) ", message).group(1), scale="utc")
+    assert late.t_start.unix <= quoted.unix < late.t_stop.unix
+
+
 def _sun_unit_vectors(coords, times):
     """Sun direction per trajectory sample, from a 10 s ephemeris grid.
 
@@ -330,9 +371,7 @@ def test_five_patch_night_ce_science_clears_the_zone(site, coordinates):
         start_time="2026-12-15T09:00:00",
         end_time="2026-12-16T09:00:00",
     )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        pairs = schedule_to_trajectories(timeline)
+    pairs = schedule_to_trajectories(timeline)
     assert len(pairs) >= 5  # the night still schedules constant-elevation science
 
     radius = site.sun_avoidance.exclusion_radius

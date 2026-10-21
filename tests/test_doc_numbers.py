@@ -174,6 +174,7 @@ class TestRenderedSimulatorDefaults:
                 night.az_speed,
                 night.az_accel,
             ],
+            "Calibration-night dispatch lead": [night.dispatch_lead_seconds],
         }
         assert set(expected) <= set(cells)
         for parameter, values in expected.items():
@@ -382,7 +383,7 @@ class TestCalibrationNightNumbers:
 
     The leg is built from the shipped ``CalibrationNightPolicy`` rates and the
     throw solved for the page's first pass (one module width over the cosine
-    of its 61.5 deg elevation), so these numbers move with those defaults.
+    of its 61.4 deg elevation), so these numbers move with those defaults.
     The 1.5 deg/s and 1.0 deg/s^2 rates are commissioning values pending
     instrument-team ratification ("Pending instrument verification" in
     ``docs/index.rst``); a change fails here until the page's figures move with it.
@@ -401,7 +402,7 @@ class TestCalibrationNightNumbers:
         config = ConstantElScanConfig(
             timestep=0.1,
             az_start=0.0,
-            az_stop=2.0 * MODULE_FOV_RADIUS_DEG / math.cos(math.radians(61.5)),
+            az_stop=2.0 * MODULE_FOV_RADIUS_DEG / math.cos(math.radians(61.4)),
             elevation=45.0,
             az_speed=night.az_speed,
             az_accel=night.az_accel,

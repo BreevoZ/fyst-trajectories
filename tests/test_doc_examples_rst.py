@@ -271,28 +271,25 @@ def _doc_seed_trajectory():
     """Build a >= 700 s trajectory that the retune / export pages assume already exists.
 
     Read-only across pages (``inject_retune`` and ``to_path_format`` do not mutate it),
-    so it is built once per session. Any advisory from this scaffolding config is
-    test-internal, not a published example, and is suppressed here.
+    so it is built once per session.
     """
     site = get_fyst_site()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", PointingWarning)
-        return (
-            TrajectoryBuilder(site)
-            .with_config(
-                ConstantElScanConfig(
-                    timestep=0.1,
-                    az_start=120.0,
-                    az_stop=180.0,
-                    elevation=45.0,
-                    az_speed=1.0,
-                    az_accel=0.5,
-                )
+    return (
+        TrajectoryBuilder(site)
+        .with_config(
+            ConstantElScanConfig(
+                timestep=0.1,
+                az_start=120.0,
+                az_stop=180.0,
+                elevation=45.0,
+                az_speed=1.0,
+                az_accel=0.5,
             )
-            .duration(700.0)
-            .starting_at(Time("2026-03-15T04:00:00", scale="utc"))
-            .build()
         )
+        .duration(700.0)
+        .starting_at(Time("2026-03-15T04:00:00", scale="utc"))
+        .build()
+    )
 
 
 def _seed_namespace(tmp_path, trajectory):

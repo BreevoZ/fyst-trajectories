@@ -13,10 +13,16 @@ import copy
 import dataclasses
 import pickle
 import warnings
+from decimal import Decimal
 
 import numpy as np
 import pytest
-from _source_ces_helpers import _FULL_PRIMECAM_MODULES, _JUPITER_NIGHT, _full_primecam_block
+from _source_ces_helpers import (
+    _FULL_PRIMECAM_MODULES,
+    _JUPITER_NIGHT,
+    _MALFORMED_AZ_PADDINGS,
+    _full_primecam_block,
+)
 from _sun_stubs import allow_everything, block_everything
 from astropy import units as u
 from astropy.time import Time, TimeDelta
@@ -622,6 +628,35 @@ def test_negative_az_padding_is_refused(site, entry):
         )
 
 
+_JUPITER_C_RISING = dict(
+    body="jupiter", footprint="c", el_bore=35.0, night=_JUPITER_NIGHT, mode="rising"
+)
+
+
+@pytest.mark.parametrize(
+    "bad", list(_MALFORMED_AZ_PADDINGS.values()), ids=list(_MALFORMED_AZ_PADDINGS)
+)
+@pytest.mark.parametrize(
+    "entry", [compute_source_ces_params, plan_source_ces, plan_source_ces_passes]
+)
+def test_malformed_az_padding_is_refused(site, entry, bad):
+    """A padding that is not a real number in [0, 360] is a ValueError that names it.
+
+    It is refused before any astronomy runs, as a malformed request, never as
+    an infeasibility.
+    """
+    kwargs = dict(n_passes=2) if entry is plan_source_ces_passes else {}
+    with pytest.raises(ValueError, match="az_padding") as excinfo:
+        entry(site=site, az_padding=bad, **_JUPITER_C_RISING, **kwargs)
+    assert not isinstance(excinfo.value, PointingError)
+
+
+def test_a_full_turn_of_padding_reaches_the_azimuth_limits(site):
+    """360 deg is the widest padding accepted, and its sweep exceeds the azimuth range."""
+    with pytest.raises(AzimuthBoundsError):
+        compute_source_ces_params(site=site, az_padding=360.0, **_JUPITER_C_RISING)
+
+
 def test_empty_footprint_sequence_raises(site):
     with pytest.raises(ValueError, match="footprint sequence cannot be empty"):
         plan_source_ces(
@@ -783,13 +818,40 @@ def test_array_footprint_from_array_info_rejects_unknown_units(bad):
         ArrayFootprint.from_array_info(info, units=bad)
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [True, np.array([0.05]), "0.05", None, np.nan],
+    ids=["bool", "array", "text", "none", "nan"],
+)
+@pytest.mark.parametrize("index", [0, 1])
+def test_array_footprint_from_array_info_refuses_a_bad_center_by_name(index, bad):
+    """A center coordinate that is not a finite real number is refused before it is scaled.
+
+    ``float`` would read a ``bool`` as 0 or 1, 1 rad on the default radian
+    path, and parse text.
+    """
+    center = [0.0, 0.0]
+    center[index] = bad
+    info = {"center": tuple(center), "cover": (np.array([0.01]), np.array([0.0]))}
+    with pytest.raises(
+        ValueError, match=rf"^array_info\['center'\]\[{index}\] must be a (real|finite) number"
+    ):
+        ArrayFootprint.from_array_info(info)
+
+
+def _square_kwargs(**overrides) -> dict:
+    """Return the square footprint's constructor arguments, with ``overrides`` applied."""
+    return {
+        "center_xi_deg": 0.05,
+        "center_eta_deg": -0.05,
+        "cover_xi_deg": np.array([-0.1, 0.1, 0.1, -0.1]),
+        "cover_eta_deg": np.array([-0.1, -0.1, 0.1, 0.1]),
+        **overrides,
+    }
+
+
 def _square_footprint() -> ArrayFootprint:
-    return ArrayFootprint(
-        center_xi_deg=0.05,
-        center_eta_deg=-0.05,
-        cover_xi_deg=np.array([-0.1, 0.1, 0.1, -0.1]),
-        cover_eta_deg=np.array([-0.1, -0.1, 0.1, 0.1]),
-    )
+    return ArrayFootprint(**_square_kwargs())
 
 
 def test_array_footprint_copies_cover_arrays():
@@ -861,6 +923,37 @@ def test_array_footprint_compares_and_hashes_by_identity():
     assert len({fp_a, fp_b}) == 2
 
 
+@pytest.mark.parametrize("bad", [np.nan, np.inf], ids=["nan", "inf"])
+@pytest.mark.parametrize("array", ["cover_xi_deg", "cover_eta_deg"])
+def test_array_footprint_refuses_a_non_finite_vertex_by_array_and_index(array, bad):
+    """A NaN or infinite vertex is refused at construction, naming its array and index."""
+    cover = _square_kwargs()[array].copy()
+    cover[2] = bad
+    with pytest.raises(ValueError, match=rf"^{array}\[2\] must be a finite number, got {bad}"):
+        ArrayFootprint(**_square_kwargs(**{array: cover}))
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [True, np.array([0.05]), "0.05", None, np.nan],
+    ids=["bool", "array", "text", "none", "nan"],
+)
+@pytest.mark.parametrize("field", ["center_xi_deg", "center_eta_deg"])
+def test_array_footprint_refuses_a_bad_centre_by_name(field, bad):
+    """A centre that is not a finite real number is refused at construction, by name."""
+    with pytest.raises(ValueError, match=f"^{field} must be a (real|finite) number"):
+        ArrayFootprint(**_square_kwargs(**{field: bad}))
+
+
+def test_array_footprint_stores_its_centre_as_floats():
+    """A ``Decimal`` or a 0-d array centre is held as the float it equals."""
+    fp = ArrayFootprint(
+        **_square_kwargs(center_xi_deg=Decimal("0.05"), center_eta_deg=np.array(-0.05))
+    )
+    assert [type(fp.center_xi_deg), type(fp.center_eta_deg)] == [float, float]
+    assert (fp.center_xi_deg, fp.center_eta_deg) == (0.05, -0.05)
+
+
 def test_scan_block_compares_and_hashes_by_identity():
     """A block is hashable and unequal to its replace copy, on every interpreter.
 
@@ -891,6 +984,59 @@ def test_scan_block_compares_and_hashes_by_identity():
     assert block in {block}
     assert block == block
     assert block != dataclasses.replace(block)
+
+
+class TestComputedParamsReadOnly:
+    """``computed_params`` is a read-only ``dict``, copied from the one the block is given."""
+
+    _PARAMS = {"az_start": 100.0, "az_stop": 102.0, "n_scans": 2}
+
+    @classmethod
+    def _block(cls, computed_params=None):
+        trajectory = Trajectory(
+            times=np.array([0.0, 1.0, 2.0]),
+            az=np.array([100.0, 101.0, 102.0]),
+            el=np.full(3, 45.0),
+            az_vel=np.ones(3),
+            el_vel=np.zeros(3),
+        )
+        return ScanBlock(
+            trajectory=trajectory,
+            config=ConstantElScanConfig(
+                az_start=100.0,
+                az_stop=102.0,
+                elevation=45.0,
+                az_speed=1.0,
+                az_accel=1.0,
+                timestep=0.1,
+            ),
+            duration=2.0,
+            computed_params=dict(cls._PARAMS) if computed_params is None else computed_params,
+        )
+
+    def test_construction_copies_the_callers_dict(self):
+        params = dict(self._PARAMS)
+        block = self._block(params)
+        params["az_start"] = 9.0
+        assert block.computed_params == self._PARAMS
+
+    def test_replace_with_an_edited_copy_rewraps_it(self):
+        block = self._block()
+        edited = dataclasses.replace(
+            block, computed_params={**block.computed_params, "az_start": 3.0}
+        )
+        assert edited.computed_params["az_start"] == 3.0
+        assert block.computed_params["az_start"] == 100.0
+        with pytest.raises(TypeError, match="read-only"):
+            edited.computed_params["az_start"] = 9.0
+
+    def test_planned_block_holds_a_read_only_copy_equal_to_the_params(self, site):
+        kwargs = dict(site=site, **_JUPITER_C_RISING)
+        block = plan_source_ces(**kwargs)
+        assert isinstance(block.computed_params, dict)
+        assert block.computed_params == compute_source_ces_params(**kwargs)
+        with pytest.raises(TypeError, match="read-only"):
+            block.computed_params["el_bore"] = 40.0
 
 
 # ---------------------------------------------------------------------------

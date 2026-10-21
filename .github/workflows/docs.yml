@@ -6,9 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Pinned to ubuntu-24.04 like every job in tests.yml, so the ubuntu-latest
+# migration of 2026-10-19 is a deliberate upgrade here too.
 jobs:
   build-docs:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v5

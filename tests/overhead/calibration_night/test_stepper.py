@@ -15,10 +15,14 @@ import warnings
 
 import numpy as np
 import pytest
+from _calibration_night_helpers import _with_policy
+from _source_ces_helpers import _assert_same_pass
 from _sun_stubs import fake_sun_model, pose_blocker
+from astropy.table import Table
 from astropy.time import Time, TimeDelta
 
 from fyst_trajectories import MODULE_FOV_RADIUS_DEG, PRIMECAM_MODULES, get_fyst_site
+from fyst_trajectories.exceptions import PointingWarning
 from fyst_trajectories.overhead import (
     BOOTSTRAP_POSE,
     BlockNotReconstructableError,
@@ -29,14 +33,17 @@ from fyst_trajectories.overhead import (
     NightContext,
     NightState,
     ObservingTimeline,
+    OverheadModel,
     ScanOverrides,
     ScanParameterTable,
     ScanParamsSchemaError,
     ScriptedSelection,
     TimelineBlock,
+    TuningPolicy,
     VisitPlan,
     advance_idle,
     commit_visit,
+    dispatch_sheet,
     list_candidates,
     plan_calibration_night,
     plan_visit,
@@ -49,9 +56,12 @@ from fyst_trajectories.overhead import (
 from fyst_trajectories.overhead.calibration_night import step
 from fyst_trajectories.overhead.calibration_night.tables import table_for
 from fyst_trajectories.overhead.simulation import _generate_trajectory_for_block
+from fyst_trajectories.overhead.utils import _search_start_time
 
 NIGHT_START = "2026-09-11T06:30:00"
 NIGHT_END = "2026-09-11T08:00:00"
+
+_DIP = CalibrationNightPolicy(tuning=TuningPolicy(skydip_after_retune=True))
 
 
 def _parked_visit(state, ctx, body, overrides=None, *, duration=600.0):
@@ -376,22 +386,24 @@ def _without_search_start(blocks):
     ]
 
 
-def _assert_same_pass(rebuilt, planned):
-    """Every sample, the start instant, the duration and every solved value, to the bit."""
-    for name in ("times", "az", "el", "az_vel", "el_vel", "scan_flag"):
-        assert np.array_equal(getattr(rebuilt.trajectory, name), getattr(planned.trajectory, name))
-    got, want = rebuilt.trajectory.start_time, planned.trajectory.start_time
-    assert (got.jd1, got.jd2) == (want.jd1, want.jd2)
-    assert rebuilt.duration == planned.duration
-    assert rebuilt.computed_params == planned.computed_params
+def _rebuild(timeline):
+    """Rebuild a timeline's pass blocks, returning ``(block, rebuilt)`` pairs.
+
+    A rebuilt Saturn pass high enough raises the high-elevation speed
+    advisory.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="High elevation reduces on-sky azimuth speed",
+            category=PointingWarning,
+        )
+        return schedule_to_trajectories(timeline, science_only=False)
 
 
 def _rebuild_visit(ctx, state, plan, blocks=None):
     """Rebuild a visit's pass blocks, returning ``(block, rebuilt)`` pairs."""
-    timeline = _visit_timeline(ctx, state, plan.blocks if blocks is None else blocks)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        return schedule_to_trajectories(timeline, science_only=False)
+    return _rebuild(_visit_timeline(ctx, state, plan.blocks if blocks is None else blocks))
 
 
 @pytest.fixture(scope="module")
@@ -399,9 +411,7 @@ def saturn_visit(site):
     """One real Saturn visit from the bootstrap pose at the start of the night."""
     ctx = NightContext.build(["saturn", "jupiter", "uranus"], site, NIGHT_START, NIGHT_END)
     state = NightState.initial(ctx.start_time)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        plan = plan_visit(state, ctx, "saturn")
+    plan = plan_visit(state, ctx, "saturn")
     return ctx, state, plan
 
 
@@ -504,9 +514,7 @@ class TestRealVisit:
         ctx, state, plan = saturn_visit
         timeline = _visit_timeline(ctx, state, plan.blocks)
         assert timeline.validate() == []
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            pairs = schedule_to_trajectories(timeline, science_only=False)
+        pairs = _rebuild(timeline)
         assert len(pairs) == 1
         block, rebuilt = pairs[0]
         _assert_same_pass(rebuilt, plan.passes[0])
@@ -522,9 +530,7 @@ class TestRealVisit:
         """
         ctx, state, plan = saturn_visit
         timeline = _visit_timeline(ctx, state, _without_search_start(plan.blocks))
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            ((block, rebuilt),) = schedule_to_trajectories(timeline, science_only=False)
+        ((block, rebuilt),) = _rebuild(timeline)
         assert abs((rebuilt.trajectory.start_time - block.t_start).to_value("s")) < 0.1
         assert rebuilt.computed_params["az_throw"] == pytest.approx(
             block.metadata["applied"]["az_throw"], abs=5e-4
@@ -541,9 +547,7 @@ class TestRealVisit:
         policy = CalibrationNightPolicy(footprint="IM0")
         ctx = NightContext.build(["saturn"], site, NIGHT_START, NIGHT_END, policy=policy)
         state = NightState.initial(ctx.start_time)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            plan = plan_visit(state, ctx, "saturn")
+        plan = plan_visit(state, ctx, "saturn")
         assert plan.feasible, plan.summary
         assert not any("centred footprints only" in w for w in plan.warnings)
         assert plan.blocks[-1].metadata["scan_params"]["footprint"] == "c"
@@ -555,18 +559,14 @@ class TestRealVisit:
 
     def test_body_below_the_band_is_infeasible_not_raised(self, saturn_visit):
         ctx, state, _ = saturn_visit
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            plan = plan_visit(state, ctx, "jupiter")
+        plan = plan_visit(state, ctx, "jupiter")
         assert not plan.feasible
         assert plan.reason in (DeferralReason.UNPLANNABLE, DeferralReason.BELOW_BAND)
         assert plan.blocks == ()
 
     def test_overrides_win_over_policy_and_table(self, saturn_visit):
         ctx, state, _ = saturn_visit
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            plan = plan_visit(state, ctx, "saturn", ScanOverrides(az_speed=0.8, az_throw=3.0))
+        plan = plan_visit(state, ctx, "saturn", ScanOverrides(az_speed=0.8, az_throw=3.0))
         assert plan.feasible, plan.summary
         meta = plan.blocks[-1].metadata
         assert meta["requested"]["az_speed"] == 0.8 and meta["requested"]["az_throw"] == 3.0
@@ -577,22 +577,22 @@ class TestRealVisit:
         policy = CalibrationNightPolicy(use_table_dwell=True)
         ctx = NightContext.build(["uranus"], site, NIGHT_START, NIGHT_END, policy=policy)
         state = NightState.initial(ctx.start_time)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            plan = plan_visit(state, ctx, "uranus")
+        plan = plan_visit(state, ctx, "uranus")
         assert plan.feasible, plan.summary
         assert any("exceeds this crossing" in w for w in plan.warnings)
         assert "dwell" not in plan.blocks[-1].metadata["scan_params"]
 
 
-# The default Saturn visit of ``saturn_visit`` as the planner recorded it
-# before the solved throw became the default (table throw, az_accel 1.5).
-# Recorded by running that version, not derived.
+# The default Saturn visit of ``saturn_visit`` under v0.9.0's choices (the
+# table's throw, az_accel 1.5, no dispatch lead), recorded by running the
+# planner, not derived. The anchor estimate has priced the settle and the
+# body's motion since 2026-10-17, so this visit sits 2.2 s after the one
+# v0.9.0 itself planned.
 _TABLE_THROW_VISIT = {
     "scan_params": {
         "body": "saturn",
         "footprint": "c",
-        "el_bore": 61.480398064863735,
+        "el_bore": 61.476908061165524,
         "mode": "setting",
         "boresight_rot": None,
         "timestep": 0.1,
@@ -601,16 +601,16 @@ _TABLE_THROW_VISIT = {
         "n_passes": 1,
         "az_speed": 1.5,
         "az_accel": 1.5,
-        "az_throw": 4.502110539438211,
+        "az_throw": 4.501590893066719,
     },
-    "requested": {"az_speed": 1.5, "az_accel": 1.5, "az_throw": 4.502110539438211},
+    "requested": {"az_speed": 1.5, "az_accel": 1.5, "az_throw": 4.501590893066719},
     "applied": {
         "az_speed": 1.5,
         "az_accel": 1.5,
-        "az_throw": 4.502110539438211,
-        "dwell": 738.2082398912368,
+        "az_throw": 4.501590893066719,
+        "dwell": 733.1559075205384,
     },
-    "solved": {"az_throw": 4.502110539438211, "crossing_seconds": 736.0076316649648},
+    "solved": {"az_throw": 4.501590893066719, "crossing_seconds": 735.6131056047999},
 }
 
 
@@ -713,24 +713,23 @@ class TestPassThrow:
     def test_a_rebuild_re_solves_the_footprint_throw(self, saturn_visit):
         """The dict carries no throw, so the rebuild solves it again on the planner's grid."""
         ctx, state, plan = saturn_visit
-        timeline = _visit_timeline(ctx, state, plan.blocks)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            ((block, rebuilt),) = schedule_to_trajectories(timeline, science_only=False)
+        ((block, rebuilt),) = _rebuild(_visit_timeline(ctx, state, plan.blocks))
         params = block.metadata["scan_params"]
         assert "az_throw" not in params and params["az_padding"] == 0.0
         # The rebuild repeats the planner's search, so the solve sees the same
         # samples and lands on the recorded throw exactly.
         assert rebuilt.computed_params["az_throw"] == block.metadata["solved"]["az_throw"]
 
-    def test_the_switch_restores_the_previous_visit(self, site):
-        """With the table throw and the old acceleration, the visit is the one recorded before."""
+    def test_the_table_throw_visit_is_the_one_recorded(self, site):
+        """With the table throw, the old acceleration and no lead, the visit is the one recorded."""
         ctx = NightContext.build(
             ["saturn", "jupiter", "uranus"],
             site,
             NIGHT_START,
             NIGHT_END,
-            policy=CalibrationNightPolicy(use_table_throw=True, az_accel=1.5),
+            policy=CalibrationNightPolicy(
+                use_table_throw=True, az_accel=1.5, dispatch_lead_seconds=0.0
+            ),
         )
         plan = plan_visit(NightState.initial(ctx.start_time), ctx, "saturn")
         assert plan.feasible, plan.summary
@@ -744,9 +743,7 @@ def three_pass_visit(site):
     policy = CalibrationNightPolicy(n_passes=3)
     ctx = NightContext.build(["saturn"], site, NIGHT_START, "2026-09-11T09:30:00", policy=policy)
     state = NightState.initial(ctx.start_time)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        plan = plan_visit(state, ctx, "saturn")
+    plan = plan_visit(state, ctx, "saturn")
     return ctx, state, plan
 
 
@@ -859,9 +856,7 @@ class TestMultiPassVisit:
             b.metadata["search_start"] for b in reloaded.blocks if "search_start" in b.metadata
         ] == [b.metadata["search_start"] for b in blocks]
         for timeline in (_visit_timeline(ctx, state, plan.blocks), reloaded):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                pairs = schedule_to_trajectories(timeline, science_only=False)
+            pairs = _rebuild(timeline)
             assert len(pairs) == len(plan.passes) == 3
             for (_, rebuilt), planned in zip(pairs, plan.passes):
                 _assert_same_pass(rebuilt, planned)
@@ -953,9 +948,7 @@ class TestMultiPassVisit:
             policy=CalibrationNightPolicy(n_passes=3),
         )
         state = NightState.initial(ctx.start_time, (-35.0, 50.0))
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            plan = plan_visit(state, ctx, "saturn")
+        plan = plan_visit(state, ctx, "saturn")
 
         assert plan.feasible, plan.summary
         assert len(plan.passes) == 3
@@ -1052,7 +1045,8 @@ class TestPlanVisitRefusals:
     the boresight elevation across the re-anchor) or a kernel run's
     advisories fails here. The visits are on 2026-09-11 from 06:30 UTC,
     where Saturn's default visit is feasible: the slew lands at 06:30:58,
-    the detector operations end at 06:45:58 and the pass starts 30 s later.
+    the detector operations end at 06:45:58 and the pass starts 50 s later
+    (the policy's 20 s dispatch lead, then the kernel's own offset).
     """
 
     def test_below_band(self, site):
@@ -1163,8 +1157,9 @@ class TestPlanVisitRefusals:
         """The retune pose is judged at the arrival the visit will use.
 
         The transition's own gate checks the pose at the arrival it
-        computed; a slew 20 s later than that (under the 30 s of slack
-        before the pass, so no re-anchor) puts the arrival inside a Sun
+        computed; a slew 20 s later than that (under the 30 s the kernel's
+        offset leaves past the reserved time, so no re-anchor) puts the
+        arrival inside a Sun
         window opening just after the computed arrival, which the
         transition never saw, and only the visit's gate sees it.
         """
@@ -1189,7 +1184,7 @@ class TestPlanVisitRefusals:
 
         The stub's zone covers the sky above 50 deg from 06:50, which the
         slew (06:30:58), the retune pose and the transition's hold
-        (to 06:43:16) all precede; the pass (from 06:46:28) runs into it.
+        (to 06:43:11) all precede; the pass (from 06:46:48) runs into it.
         """
         import numpy as np
 
@@ -1211,8 +1206,9 @@ class TestPlanVisitRefusals:
     def test_a_late_slew_past_the_reanchor_closes_the_window(self, site, monkeypatch):
         """The one re-anchor is spent and the slew is still late.
 
-        The first slew is 40 s late, past the 30 s of slack, so the visit
-        re-anchors; the second is 2000 s late, past the new anchor too.
+        The first slew is 40 s late, past the 30 s the kernel's offset
+        leaves beyond the reserved time, so the visit re-anchors; the
+        second is 2000 s late, past the new anchor too.
         """
         planned = _record_transitions(monkeypatch, delays=(40.0, 2000.0))
         kernel = _record_kernel_calls(monkeypatch)
@@ -1240,11 +1236,12 @@ class TestPlanVisitRefusals:
         )
         assert plan.feasible, plan.summary
         assert len(plan.passes) == 2
-        assert _kinds(plan.warnings) == [
-            "dwell applies to a single pass; a multi-pass visit scans the crossing",
-            *_KERNEL,
-            *_KERNEL,
-        ]
+        kinds = _kinds(plan.warnings)
+        assert kinds[0] == "dwell applies to a single pass; a multi-pass visit scans the crossing"
+        # The second pass sits on the 60 deg speed-advisory threshold, warning
+        # or not with a small move of its anchor, so the kernel's advisories
+        # are pinned by kind, not by count.
+        assert set(kinds[1:]) == set(_KERNEL)
         assert len(kernel) == 1 and "dwell" not in kernel[0]
         for block in plan.blocks:
             if block.scan_type == "planet_cal":
@@ -1252,40 +1249,44 @@ class TestPlanVisitRefusals:
                 assert "dwell" not in block.metadata["requested"]
 
 
-def test_a_visit_whose_anchor_probe_grazes_the_module_is_deferred_as_under_the_table(site):
-    """The solved-throw night defers the body exactly as the table-throw night does.
+def test_a_visit_whose_anchor_probe_grazes_the_module_plans_as_under_the_table(site):
+    """The solved-throw night plans the body's pass where the table-throw night does.
 
     The night starts so that its first Neptune visit on i2, on 2026-09-11, is
-    anchored at 04:35:49.303, 2.9 deg below Neptune's culmination and in the
+    anchored at 04:35:49.303 (no dispatch lead, so the start alone places the
+    anchor), 2.9 deg below Neptune's culmination and in the
     middle of the band of anchors where the probe that derives the boresight
     elevation lifts the module so high that Neptune reaches only one of its
     cover vertices. The probe reads only its start, so the padding the solved
-    throw plans with (none) has no say, and the visit takes the real solve's
-    refusal: the derived boresight elevation lies below Neptune's elevation at
-    the anchor, so the forward search takes the next day's arc, which the 24 h
-    window cuts off below the module's top edge.
+    throw plans with (none) has no say. The module's cover lies above the
+    boresight there, so under either throw the boresight elevation is anchored
+    on Neptune and the pass starts when Neptune reaches the module, 3.3 min
+    after the anchor; only the swept throw differs.
     """
 
     def night(use_table_throw):
-        policy = CalibrationNightPolicy(footprint="i2", use_table_throw=use_table_throw)
+        policy = CalibrationNightPolicy(
+            footprint="i2", use_table_throw=use_table_throw, dispatch_lead_seconds=0.0
+        )
         timeline = plan_calibration_night(
             ["neptune"],
             site,
-            "2026-09-11T04:19:59.511",
-            "2026-09-11T04:25:59.511",
+            "2026-09-11T04:19:51.985",
+            "2026-09-11T04:55:00",
             policy=policy,
         )
-        return read_calibration_night_metadata(timeline)
+        (block,) = [b for b in timeline.blocks if b.scan_type == "planet_cal"]
+        return block
 
     solved, table = night(False), night(True)
-    assert solved["deferrals"] == [
-        {"at": "2026-09-11 04:19:59.511", "body": "neptune", "reason": "unplannable"}
-    ]
-    assert solved["deferrals"] == table["deferrals"]
-    assert solved["warnings"] == table["warnings"]
-    # The refusal names the anchor, which pins the visit to the band's middle.
-    refusal = solved["warnings"][-1]["message"]
-    assert "Neptune is not fully observable at 2026-09-11 04:35:49.303" in refusal
+    for block in (solved, table):
+        # The search start is the anchor, which pins the visit to the band's middle.
+        assert _search_start_time(block.metadata["search_start"]).iso == "2026-09-11 04:35:49.303"
+        assert block.metadata["t0_scan"] == "2026-09-11 04:39:06.237"
+    assert solved.metadata["scan_params"]["el_bore"] == table.metadata["scan_params"]["el_bore"]
+    crossing = solved.metadata["solved"]["crossing_seconds"]
+    assert crossing == table.metadata["solved"]["crossing_seconds"]
+    assert solved.metadata["applied"]["az_throw"] < table.metadata["applied"]["az_throw"]
 
 
 class TestCandidates:
@@ -1382,9 +1383,7 @@ class TestSunEscape:
             ["saturn"], site, NIGHT_START, NIGHT_END, sun_safe=pose_blocker(*BOOTSTRAP_POSE)
         )
         state = NightState.initial(ctx.start_time)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            plan = plan_visit(state, ctx, "saturn")
+        plan = plan_visit(state, ctx, "saturn")
 
         assert plan.feasible, plan.summary
         escape, slew = plan.blocks[:2]
@@ -1446,9 +1445,7 @@ def _planned(site, overrides=None, **context):
     """Plan one Saturn visit at the start of the night, returning the context and state too."""
     ctx = NightContext.build(["saturn", "uranus"], site, NIGHT_START, NIGHT_END, **context)
     state = NightState.initial(ctx.start_time)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        plan = plan_visit(state, ctx, "saturn", overrides)
+    plan = plan_visit(state, ctx, "saturn", overrides)
     assert plan.feasible, plan.summary
     return ctx, state, plan
 
@@ -1490,10 +1487,19 @@ class TestPassRebuildRepeatsTheSearch:
         assert escape.patch_name == "sun_escape"
         (anchor,) = [call["start_time"] for call in kernel]
         assert anchor > escape.t_stop
+        # Estimated from the escape pose and arrival, so the search start
+        # still sits the lead after the operations; from the pre-escape
+        # state it would sit 7 s short.
+        operations = [b for b in plan.blocks if b.scan_type in ("retune", "skydip")]
+        after = (anchor - operations[-1].t_stop).to_value("s")
+        assert after == pytest.approx(ctx.policy.dispatch_lead_seconds, abs=1.0)
         assert _only_pass(plan).metadata["search_start"] == [anchor.utc.jd1, anchor.utc.jd2]
         ((_, rebuilt),) = _rebuild_visit(ctx, state, plan)
         _assert_same_pass(rebuilt, plan.passes[0])
 
+    @pytest.mark.filterwarnings(
+        r"ignore:dwell=\S+ s is shorter than the:fyst_trajectories.exceptions.PointingWarning"
+    )
     def test_a_dwell_cutting_more_than_300_s_rebuilds(self, site):
         """A 60 s dwell on Saturn's 736 s crossing starts the pass 338 s into it.
 
@@ -1545,8 +1551,11 @@ class TestPassRebuildRefusesAnotherRecord:
     A record of an instant after the pass began repeats a search that finds the next day's
     crossing, which does not overlap the block, and a record of any other
     form names no instant. The rebuild refuses both with an error that names
-    the key, and the best-effort ``schedule_to_trajectories`` logs and skips
-    the block, as it does every other block it cannot rebuild.
+    the key. A search the planner itself refuses (a day late, at J2000, at an
+    instant ERFA cannot convert) raises the planner's own error, which does
+    not. The best-effort ``schedule_to_trajectories`` logs and skips the
+    block, as it does every other block it cannot rebuild, and its line names
+    the record whichever check refused it.
     """
 
     @pytest.mark.parametrize("seconds", [600.0, 6 * 3600.0], ids=["10 min", "6 h"])
@@ -1559,7 +1568,11 @@ class TestPassRebuildRefusesAnotherRecord:
             if b.scan_type == "planet_cal"
         ]
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
+            warnings.filterwarnings(
+                "ignore",
+                message="High elevation reduces on-sky azimuth speed",
+                category=PointingWarning,
+            )
             with pytest.raises(BlockNotReconstructableError, match="search_start"):
                 _generate_trajectory_for_block(block, ctx.site)
 
@@ -1575,15 +1588,41 @@ class TestPassRebuildRefusesAnotherRecord:
         with pytest.raises(ScanParamsSchemaError, match="search_start"):
             _generate_trajectory_for_block(block, ctx.site)
 
-    @pytest.mark.parametrize("record", ["later", [True, False]], ids=["later search", "booleans"])
+    @pytest.mark.parametrize(
+        "record",
+        [86400.0, [2451545.0, 0.0], [1e300, 0.0]],
+        ids=["a day late", "J2000", "1e300"],
+    )
+    def test_a_search_the_planner_refuses_raises_its_own_error(self, saturn_visit, record):
+        """No pass is found, so the overlap check never runs, and the error names no record.
+
+        A day late, Saturn culminates below the top of the footprint at the
+        recorded elevation; at J2000 it stays below the footprint all day;
+        at 1e300 days ERFA refuses the date. A number of seconds stands for
+        the recorded start moved that much later.
+        """
+        ctx, _, plan = saturn_visit
+        if isinstance(record, float):
+            record = _later_record(plan, record)
+        (block,) = [b for b in _with_search_start(plan, record) if b.scan_type == "planet_cal"]
+        with pytest.raises(ValueError) as refused:
+            _generate_trajectory_for_block(block, ctx.site)
+        assert not isinstance(refused.value, (BlockNotReconstructableError, ScanParamsSchemaError))
+        assert "search_start" not in str(refused.value)
+
+    @pytest.mark.parametrize("record", [600.0, 86400.0], ids=["later search", "a day late"])
     def test_the_best_effort_rebuild_logs_and_skips_it(self, saturn_visit, caplog, record):
+        """The logged line names the record, whichever check refused it.
+
+        A number of seconds stands for the recorded start moved that much later.
+        """
         ctx, state, plan = saturn_visit
-        if record == "later":
-            record = _later_record(plan, 600.0)
+        if isinstance(record, float):
+            record = _later_record(plan, record)
         with caplog.at_level(logging.WARNING, logger="fyst_trajectories.overhead.simulation"):
             assert _rebuild_visit(ctx, state, plan, _with_search_start(plan, record)) == []
         (logged,) = caplog.records
-        assert "search_start" in logged.getMessage()
+        assert f"(search_start={record!r})" in logged.getMessage()
 
 
 class TestSweepSunSafeFailsClosed:
@@ -1672,7 +1711,9 @@ def scripted_night(site):
     """Plan a scripted night with real plans, capturing every state the driver produced.
 
     Jupiter stays below the band, so both Jupiter entries wait out
-    ``max_wait_seconds`` and are set aside before the Saturn entries run.
+    ``max_wait_seconds`` and are set aside before the Saturn entries run;
+    the second Saturn entry finds the window closed after the first's visit,
+    waits out ``max_wait_seconds`` from that visit's end and is set aside too.
     """
     from fyst_trajectories.overhead.calibration_night import night
 
@@ -1694,9 +1735,7 @@ def scripted_night(site):
     with pytest.MonkeyPatch.context() as mp:
         for name in ("commit_visit", "advance_idle", "_idle"):
             mp.setattr(night, name, capture(getattr(night, name)))
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            timeline = night._run_night(ctx, rule)
+        timeline = night._run_night(ctx, rule)
     set_aside = []
     for state in states:
         if len(state.unplaced) > len(set_aside):
@@ -1713,12 +1752,14 @@ class TestResumeFromTimeline:
 
         The wait timer dates from the first block after the last script
         event, not from the start of the trailing run of waiting idles,
-        which spans both Jupiter entries.
+        which spans both Jupiter entries; the last Saturn entry's timer
+        dates from the end of the first Saturn visit's pass.
         """
         timeline, states, set_aside, rule = scripted_night
         assert [t.iso for t in set_aside] == [
             "2026-09-11 06:40:00.000",
             "2026-09-11 06:50:00.000",
+            "2026-09-11 07:26:18.043",
         ]
         meta = read_calibration_night_metadata(timeline)
         assert [entry["at"] for entry in meta["unplaced"]] == [t.iso for t in set_aside]
@@ -1744,14 +1785,12 @@ class TestResumeFromTimeline:
             ["saturn", "uranus"], site, "2026-09-11T06:30:00", "2026-09-11T07:30:00"
         )
         initial = NightState.initial(ctx.start_time)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            first = commit_visit(
-                initial,
-                plan_visit(initial, ctx, "saturn"),
-                retry_after=ctx.policy.retry_after_seconds,
-            )
-            expected = plan_visit(first, ctx, "saturn")
+        first = commit_visit(
+            initial,
+            plan_visit(initial, ctx, "saturn"),
+            retry_after=ctx.policy.retry_after_seconds,
+        )
+        expected = plan_visit(first, ctx, "saturn")
         assert first.script_index == 1 and first.scan_counter == 1
         for source in (timeline, _through_ecsv(timeline, tmp_path)):
             ctx_r = NightContext.from_timeline(source)
@@ -1770,9 +1809,7 @@ class TestResumeFromTimeline:
                 assert _same_time(got, want)
             resumed = NightState.from_timeline(source, first.t)
             _assert_same_state(resumed, first)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                plan = plan_visit(resumed, ctx_r, "saturn")
+            plan = plan_visit(resumed, ctx_r, "saturn")
             assert (plan.feasible, plan.reason) == (expected.feasible, expected.reason)
             assert [b.scan_type for b in plan.blocks] == [b.scan_type for b in expected.blocks]
             for got, want in zip(plan.blocks, expected.blocks):
@@ -1797,9 +1834,7 @@ class TestResumeFromTimeline:
             NightState.from_timeline(keyless, first_pass.t_stop),
             NightState.from_timeline(timeline, first_pass.t_stop),
         )
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            pairs = schedule_to_trajectories(keyless, science_only=False)
+        pairs = _rebuild(keyless)
         assert len(pairs) == 3
         for block, rebuilt in pairs:
             assert abs((rebuilt.trajectory.start_time - block.t_start).to_value("s")) < 0.1
@@ -1823,14 +1858,19 @@ class TestResumeFromTimeline:
         assert commit_visit(NightState.initial(timeline.start_time), plan).cal_state == folded
         assert NightState.from_timeline(timeline, blocks[-1].t_stop).cal_state == folded
 
-    def test_records_at_the_resume_time_count(self, short_night):
-        """Two deferrals share the instant a pass ended; a resume at that instant has both."""
-        _, timeline = short_night
+    def test_records_at_the_resume_time_count(self, short_night_with_dip):
+        """Two deferrals share the instant a pass ended; a resume at that instant has both.
+
+        The night with the dip after each retune ends its last pass with
+        more than ``min_pass_seconds`` left, so both bodies are asked again
+        at that instant and deferred.
+        """
+        _, timeline = short_night_with_dip
         meta = read_calibration_night_metadata(timeline)
-        last_at = meta["deferrals"][-1]["at"]
-        tied = {d["body"]: d["reason"] for d in meta["deferrals"] if d["at"] == last_at}
+        first_at = meta["deferrals"][0]["at"]
+        tied = {d["body"]: d["reason"] for d in meta["deferrals"] if d["at"] == first_at}
         assert sorted(tied) == ["saturn", "uranus"]
-        t = Time(last_at, scale="utc")
+        t = Time(first_at, scale="utc")
         assert any(_same_time(b.t_stop, t) for b in timeline.blocks if b.scan_type == "planet_cal")
         state = NightState.from_timeline(timeline, t)
         retry_after = meta["policy"]["retry_after_seconds"]
@@ -1875,16 +1915,8 @@ class TestResumeFromTimeline:
 
     def test_a_record_without_the_throw_switch_resumes_on_the_table(self, short_night, monkeypatch):
         """A payload written before ``use_table_throw`` existed swept the table's throw."""
-        from fyst_trajectories.overhead.calibration_night.policy import (
-            encode_calibration_night_metadata,
-        )
-
         _, timeline = short_night
-        meta = read_calibration_night_metadata(timeline)
-        policy = {k: v for k, v in meta["policy"].items() if k != "use_table_throw"}
-        older = dataclasses.replace(
-            timeline, metadata=encode_calibration_night_metadata({**meta, "policy": policy})
-        )
+        older = _with_policy(timeline, drop=("use_table_throw",))
         ctx = NightContext.from_timeline(older)
         assert ctx.policy.use_table_throw is True
         first_pass = next(b for b in older.blocks if b.scan_type == "planet_cal")
@@ -1910,6 +1942,27 @@ class TestResumeFromTimeline:
             use_table_throw
         )
         assert NightContext.from_timeline(timeline).policy.use_table_throw is use_table_throw
+
+    def test_a_record_without_the_lead_resumes_with_none(self, short_night):
+        """A payload written before ``dispatch_lead_seconds`` existed reserved nothing."""
+        _, timeline = short_night
+        older = _with_policy(timeline, drop=("dispatch_lead_seconds",))
+        assert NightContext.from_timeline(older).policy.dispatch_lead_seconds == 0.0
+        assert dispatch_sheet(older).splitlines()[2].startswith("# dispatch lead: 0 s reserved")
+
+    @pytest.mark.parametrize("lead", [0.0, 45.0])
+    def test_a_record_with_the_lead_keeps_its_value(self, site, lead):
+        ctx = NightContext.build(
+            ["saturn"],
+            site,
+            NIGHT_START,
+            NIGHT_END,
+            policy=CalibrationNightPolicy(dispatch_lead_seconds=lead),
+            visit_planner=_parked_visit,
+        )
+        timeline = _run(ctx)
+        assert read_calibration_night_metadata(timeline)["policy"]["dispatch_lead_seconds"] == lead
+        assert NightContext.from_timeline(timeline).policy.dispatch_lead_seconds == lead
 
     @pytest.mark.parametrize("tag", ["IM0", "I3"])
     def test_a_night_on_any_module_name_reads_back(self, site, tag, tmp_path):
@@ -1944,8 +1997,13 @@ class TestResumeFromTimeline:
         with pytest.raises(ValueError, match=refusal):
             NightState.from_timeline(tampered, timeline.blocks[0].t_stop)
 
-    def test_axis_limits_the_file_drops_are_refused(self, site, tmp_path):
-        """A night planned on lowered limits reads back with the FYST limits."""
+    def test_a_night_on_lowered_limits_resumes_from_its_file(self, site, tmp_path):
+        """The file holds the limits, and the record's own copy refuses a site that differs.
+
+        A file written without the header's axis-limit keys reads back with
+        the FYST limits, so the night resumes from it only with its own site
+        passed in.
+        """
         limits = site.telescope_limits
         lowered = dataclasses.replace(
             site,
@@ -1958,8 +2016,304 @@ class TestResumeFromTimeline:
         )
         timeline = _run(ctx)
         assert NightContext.from_timeline(timeline).site == lowered
-        back = _through_ecsv(timeline, tmp_path)
-        assert back.site.telescope_limits.elevation.max == 90.0
+        path = tmp_path / "night.ecsv"
+        write_timeline(timeline, path)
+        back = read_timeline(path)
+        assert back.site == lowered
+        assert NightContext.from_timeline(back).site == lowered
+
+        table = Table.read(str(path), format="ascii.ecsv")
+        for key in [k for k in table.meta if k.startswith(("site_az_", "site_el_"))]:
+            del table.meta[key]
+        table.write(str(tmp_path / "without_limits.ecsv"), format="ascii.ecsv")
+        without = read_timeline(tmp_path / "without_limits.ecsv")
+        assert without.site == site
         with pytest.raises(ValueError, match="axis limits"):
-            NightContext.from_timeline(back)
-        assert NightContext.from_timeline(back, site=lowered).site == lowered
+            NightContext.from_timeline(without)
+        assert NightContext.from_timeline(without, site=lowered).site == lowered
+
+
+class TestDispatchLead:
+    """The policy's dispatch lead: before every pass, in the ready check, in the estimate."""
+
+    def test_the_policy_refuses_a_negative_or_non_finite_lead(self):
+        assert CalibrationNightPolicy(dispatch_lead_seconds=0.0).dispatch_lead_seconds == 0.0
+        for bad in (-1.0, math.inf, math.nan):
+            with pytest.raises(ValueError, match="dispatch_lead_seconds"):
+                CalibrationNightPolicy(dispatch_lead_seconds=bad)
+
+    @pytest.mark.parametrize("lead", [20.0, 600.0])
+    def test_the_pass_starts_at_least_the_lead_after_the_operations(self, site, lead):
+        """The waiting idle before the pass is never shorter than the lead, whatever it is."""
+        _, _, plan = _planned(site, policy=CalibrationNightPolicy(dispatch_lead_seconds=lead))
+        kinds = [b.scan_type for b in plan.blocks]
+        assert kinds == ["slew", "retune", "skydip", "retune", "idle", "planet_cal"]
+        retune, idle, block = plan.blocks[-3:]
+        assert idle.metadata["reason"] == "waiting_for_pass"
+        wait = (block.t_start - retune.t_stop).to_value("s")
+        assert wait >= lead
+        assert idle.duration == pytest.approx(wait)
+
+    @pytest.mark.parametrize("settle", [5.0, 15.0])
+    def test_the_search_start_sits_the_lead_after_the_operations(self, site, settle):
+        """The anchor estimate prices the slew to the body at the anchor and adds the settle.
+
+        The search start the sheet hands the execution layer therefore sits
+        the lead after the last detector operation to within a second (0.6 s
+        here, whatever the settle); without the settle it sits 4 s short,
+        and priced to the body's position at the start of the visit, 3 s
+        long.
+        """
+        ctx, _, plan = _planned(site, overhead_model=OverheadModel(settle_time=settle))
+        retune, _, block = plan.blocks[-3:]
+        search_start = _search_start_time(block.metadata["search_start"])
+        after = (search_start - retune.t_stop).to_value("s")
+        assert after == pytest.approx(ctx.policy.dispatch_lead_seconds, abs=1.0)
+
+    def test_a_slew_late_past_the_kernel_offset_re_anchors_and_keeps_the_lead(
+        self, site, monkeypatch
+    ):
+        """A slew 40 s late eats the kernel's own offset: the visit re-anchors and keeps its lead.
+
+        The lead enters the ready check, not only the anchor; a lead added at
+        the anchor alone would leave this visit feasible on its first solve
+        with less than the lead before the pass.
+        """
+        planned = _record_transitions(monkeypatch, delays=(40.0,))
+        kernel = _record_kernel_calls(monkeypatch)
+        ctx, _, plan = _planned(site)
+        assert len(planned) == 2 and len(kernel) == 2
+        retune, idle, block = plan.blocks[-3:]
+        assert idle.metadata["reason"] == "waiting_for_pass"
+        assert (block.t_start - retune.t_stop).to_value("s") >= ctx.policy.dispatch_lead_seconds
+
+    def test_a_later_pass_without_its_lead_is_dropped(self, site):
+        """A multi-pass visit keeps a later pass only when its wait holds the step plus the lead.
+
+        At 120 s the second pass's wait after the first (about 100 s) is too
+        short, so it is dropped and the third, measured from the first, kept.
+        """
+        policy = CalibrationNightPolicy(n_passes=3, dispatch_lead_seconds=120.0)
+        ctx = NightContext.build(
+            ["saturn"], site, NIGHT_START, "2026-09-11T09:30:00", policy=policy
+        )
+        plan = plan_visit(NightState.initial(ctx.start_time), ctx, "saturn")
+        assert plan.feasible, plan.summary
+        indices = [int(p.trajectory.metadata.pattern_params["pass_index"]) for p in plan.passes]
+        assert indices == [0, 2]
+        blocks = [b for b in plan.blocks if b.scan_type == "planet_cal"]
+        assert [b.metadata["scan_params"]["pass_index"] for b in blocks] == [0, 2]
+        dropped = [w for w in plan.warnings if "dropped" in w]
+        assert len(dropped) == 1
+        assert dropped[0].startswith("pass 1 of saturn dropped: it starts")
+        assert dropped[0].endswith("plus the 120 s dispatch lead")
+        first, second = blocks
+        wait = (second.t_start - first.t_stop).to_value("s")
+        assert wait >= 120.0 + ctx.overhead_model.settle_time
+        idle = plan.blocks[plan.blocks.index(second) - 1]
+        assert idle.metadata["reason"] == "waiting_for_pass"
+        assert idle.duration == pytest.approx(wait)
+
+    @pytest.mark.parametrize("policy", [None, _DIP], ids=["default", "skydip-after-retune"])
+    def test_the_candidate_estimate_is_the_elevation_at_the_anchor(self, site, policy):
+        """list_candidates places a body where plan_visit anchors it.
+
+        The estimate reserves the same time: every detector operation and the lead.
+        """
+        ctx = NightContext.build(["saturn", "uranus"], site, NIGHT_START, NIGHT_END, policy=policy)
+        state = NightState.initial(ctx.start_time)
+        estimate = {c.body: c.el_bore_estimate for c in list_candidates(state, ctx)}["saturn"]
+        plan = plan_visit(state, ctx, "saturn")
+        anchor = _search_start_time(_only_pass(plan).metadata["search_start"])
+        _, el = ctx.body_altaz("saturn", anchor)
+        assert estimate == pytest.approx(el, abs=1e-9)
+
+
+class TestDetectorOperations:
+    """The detector operations reserved before a visit's first pass."""
+
+    @pytest.mark.parametrize(
+        "context, operations",
+        [
+            pytest.param(
+                {"overhead_model": OverheadModel(skydip_duration=0.0)},
+                ["slew", "find_detectors", "retune", "idle", "planet_cal"],
+                id="skydip",
+            ),
+            pytest.param(
+                {
+                    "policy": CalibrationNightPolicy(
+                        tuning=TuningPolicy(find_detectors_duration=0.0)
+                    )
+                },
+                ["slew", "skydip", "retune", "idle", "planet_cal"],
+                id="find-detectors",
+            ),
+            pytest.param(
+                {"overhead_model": OverheadModel(skydip_duration=0.0), "policy": _DIP},
+                ["slew", "find_detectors", "retune", "idle", "planet_cal"],
+                id="skydip-after-retune",
+            ),
+        ],
+    )
+    def test_an_operation_of_zero_duration_is_not_scheduled(self, site, context, operations):
+        """Every due operation is reserved, but one sized at 0 s leaves no block."""
+        _, _, plan = _planned(site, **context)
+        assert [b.metadata.get("operation", b.scan_type) for b in plan.blocks] == operations
+
+
+@pytest.fixture(scope="module")
+def dip_visits(site):
+    """Plan the first two Saturn visits of the short night with a skydip after every retune.
+
+    Returns the context, the first visit's plan, the state after committing
+    it, and the second visit's plan from that state.
+    """
+    ctx = NightContext.build(
+        ["saturn", "uranus"], site, "2026-09-11T06:30:00", "2026-09-11T07:30:00", policy=_DIP
+    )
+    initial = NightState.initial(ctx.start_time)
+    first = plan_visit(initial, ctx, "saturn")
+    assert first.feasible, first.summary
+    after_first = commit_visit(initial, first, retry_after=ctx.policy.retry_after_seconds)
+    second = plan_visit(after_first, ctx, "saturn")
+    assert second.feasible, second.summary
+    return ctx, first, after_first, second
+
+
+def _operation_names(plan):
+    return [b.metadata.get("operation", b.scan_type) for b in plan.blocks]
+
+
+class TestSkydipAfterRetune:
+    """``TuningPolicy(skydip_after_retune=True)``: a skydip immediately after each visit's retune.
+
+    The dip is reserved beside the cadence's skydip before the retune, at the
+    same pose, and the dispatch lead follows it. It is a skydip like any
+    other, so the cadence counts from it.
+    """
+
+    def test_the_option_is_off_by_default_and_needs_the_retune(self):
+        assert TuningPolicy().skydip_after_retune is False
+        assert CalibrationNightPolicy().tuning.skydip_after_retune is False
+        with pytest.raises(ValueError, match="skydip_after_retune needs retune_before_each_block"):
+            TuningPolicy(retune_before_each_block=False, skydip_after_retune=True)
+
+    def test_the_first_visit_dips_on_both_sides_of_its_retune(self, dip_visits):
+        """The cadence's skydip is due at the first visit, before the retune; this one follows."""
+        ctx, first, _, _ = dip_visits
+        assert _operation_names(first) == [
+            "slew",
+            "find_detectors",
+            "skydip",
+            "retune",
+            "skydip",
+            "idle",
+            "planet_cal",
+        ]
+        retune, dip = first.blocks[3:5]
+        assert dip.t_start == retune.t_stop
+        assert dip.az_start == pytest.approx(retune.az_start)
+        assert dip.elevation == pytest.approx(retune.elevation)
+        assert dip.duration == pytest.approx(ctx.overhead_model.skydip_duration)
+
+    def test_the_dip_restarts_the_cadence(self, dip_visits):
+        """The commit stamps the dip after the retune as the last skydip.
+
+        So the next visit's cadence skydip is not due, and that visit reserves
+        the retune and the dip after it.
+        """
+        _, first, after_first, second = dip_visits
+        assert after_first.cal_state.last_skydip == first.blocks[4].t_start
+        assert _operation_names(second) == ["slew", "retune", "skydip", "idle", "planet_cal"]
+
+    def test_the_pass_starts_at_least_the_lead_after_the_dip(self, dip_visits):
+        ctx, first, _, second = dip_visits
+        for plan in (first, second):
+            dip, idle, block = plan.blocks[-3:]
+            assert dip.scan_type == "skydip"
+            assert idle.metadata["reason"] == "waiting_for_pass"
+            wait = (block.t_start - dip.t_stop).to_value("s")
+            assert wait >= ctx.policy.dispatch_lead_seconds
+            assert idle.duration == pytest.approx(wait)
+
+    def test_a_slew_late_inside_the_kernel_offset_keeps_the_first_solve(self, site, monkeypatch):
+        """A slew 20 s late is inside the 28 s the kernel's offset leaves past the reserved time.
+
+        The dip is in the anchor and in the ready check alike, so the margin
+        before a re-anchor is the kernel's offset, as without the option.
+        """
+        planned = _record_transitions(monkeypatch, delays=(20.0,))
+        kernel = _record_kernel_calls(monkeypatch)
+        _planned(site, policy=_DIP)
+        assert len(planned) == 1 and len(kernel) == 1
+
+    def test_a_late_slew_re_anchors_and_keeps_the_lead_after_the_dip(self, site, monkeypatch):
+        """A slew 40 s late re-anchors the visit, as it does without the option."""
+        planned = _record_transitions(monkeypatch, delays=(40.0,))
+        kernel = _record_kernel_calls(monkeypatch)
+        ctx, _, plan = _planned(site, policy=_DIP)
+        assert len(planned) == 2 and len(kernel) == 2
+        dip, idle, block = plan.blocks[-3:]
+        assert dip.scan_type == "skydip"
+        assert idle.metadata["reason"] == "waiting_for_pass"
+        assert (block.t_start - dip.t_stop).to_value("s") >= ctx.policy.dispatch_lead_seconds
+
+    def test_a_slew_late_past_the_re_anchor_closes_the_window(self, site, monkeypatch):
+        """A second slew 200 s late overruns the re-anchored pass by less than the dip.
+
+        So the final check refuses the visit only because it counts the dip; a
+        check that left the dip out would keep a pass starting before the dip
+        ends.
+        """
+        planned = _record_transitions(monkeypatch, delays=(40.0, 200.0))
+        kernel = _record_kernel_calls(monkeypatch)
+        plan = _saturn_visit(site, policy=_DIP)
+        assert plan.reason is DeferralReason.WINDOW_CLOSED
+        assert len(planned) == 2 and len(kernel) == 2
+
+    def test_no_dip_follows_a_retune_of_zero_duration(self, site):
+        """A retune sized at 0 s is not scheduled, so neither is the dip after it.
+
+        The cadence's skydip, due at the first visit, is still reserved.
+        """
+        _, _, plan = _planned(site, overhead_model=OverheadModel(retune_duration=0.0), policy=_DIP)
+        assert _operation_names(plan) == ["slew", "find_detectors", "skydip", "idle", "planet_cal"]
+
+    @pytest.mark.parametrize("dip", [False, True])
+    def test_the_record_keeps_the_option(self, site, dip):
+        policy = CalibrationNightPolicy(tuning=TuningPolicy(skydip_after_retune=dip))
+        ctx = NightContext.build(
+            ["saturn"], site, NIGHT_START, NIGHT_END, policy=policy, visit_planner=_parked_visit
+        )
+        timeline = _run(ctx)
+        tuning = read_calibration_night_metadata(timeline)["policy"]["tuning"]
+        assert tuning["skydip_after_retune"] is dip
+        assert NightContext.from_timeline(timeline).policy == policy
+
+    def test_a_record_without_the_option_reads_it_off(self, short_night):
+        """A tuning record written before the option existed is read with it off, at version 1."""
+        from fyst_trajectories.overhead.calibration_night.policy import CALNIGHT_SCHEMA_VERSION
+
+        _, timeline = short_night
+        tuning = read_calibration_night_metadata(timeline)["policy"]["tuning"]
+        older = _with_policy(
+            timeline, tuning={k: v for k, v in tuning.items() if k != "skydip_after_retune"}
+        )
+        assert older.metadata["calnight_schema_version"] == CALNIGHT_SCHEMA_VERSION == 1
+        assert NightContext.from_timeline(older).policy.tuning.skydip_after_retune is False
+
+    def test_the_night_resumes_from_its_file(self, short_night_with_dip, dip_visits, tmp_path):
+        """The replay stamps the dip after the retune, and the next visit is the driver's."""
+        _, timeline = short_night_with_dip
+        ctx, _, after_first, second = dip_visits
+        for source in (timeline, _through_ecsv(timeline, tmp_path)):
+            ctx_r = NightContext.from_timeline(source)
+            assert ctx_r.policy == ctx.policy == _DIP
+            resumed = NightState.from_timeline(source, after_first.t)
+            _assert_same_state(resumed, after_first)
+            plan = plan_visit(resumed, ctx_r, "saturn")
+            assert _operation_names(plan) == _operation_names(second)
+            for got, want in zip(plan.blocks, second.blocks, strict=True):
+                assert _same_time(got.t_start, want.t_start)
+                assert _same_time(got.t_stop, want.t_stop)

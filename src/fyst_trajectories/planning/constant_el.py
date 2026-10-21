@@ -6,7 +6,12 @@ import numpy as np
 from astropy import units as u
 from astropy.time import Time, TimeDelta
 
-from .._validation import _require_non_negative, _require_positive
+from .._validation import (
+    AZ_PADDING_MAX_DEG,
+    _require_finite,
+    _require_non_negative,
+    _require_positive,
+)
 from ..coordinates import Coordinates
 from ..patterns.configs import ConstantElScanConfig
 from ..site import AtmosphericConditions, Site
@@ -95,14 +100,14 @@ def plan_constant_el_scan(
         Rotation angle of the field region in degrees. Default is 0.0.
     az_accel : float, optional
         Azimuth acceleration in azimuth coordinate degrees/second^2
-        (mount frame, not on-sky). Default is 1.0.
+        (mount frame, not on-sky). Default is 1.0. Must be positive.
     timestep : float, optional
         Time between trajectory points in seconds. Default is 0.1.
     detector_offset : InstrumentOffset or None, optional
         If provided, adjust the trajectory for this detector offset.
     az_padding : float, optional
         Extra azimuth padding in degrees on each side of the computed
-        range. Default is 2.0. Must be non-negative.
+        range. Default is 2.0. Must lie in ``[0, 360]``.
     atmosphere : AtmosphericConditions or None, optional
         Refraction model for the elevation-crossing search and the azimuth
         range; the commanded ``elevation`` itself is never refracted.
@@ -157,7 +162,11 @@ def plan_constant_el_scan(
     Raises
     ------
     ValueError
-        If ``velocity`` is not positive, if ``az_padding`` is negative, if
+        If ``elevation`` is not a finite real number, if ``velocity`` or
+        ``az_accel`` is not a positive one (a ``bool``, an array of one or
+        more dimensions, text and ``None`` are not real numbers here), if
+        ``timestep``, ``max_search_hours`` or ``step_seconds`` is not
+        positive, if ``az_padding`` is not a real number in ``[0, 360]``, if
         ``rising`` and ``lsa_window`` are supplied together, or if
         ``lsa_window`` is supplied with equal endpoints or values outside
         ``[0, 360)``.
@@ -216,8 +225,14 @@ def plan_constant_el_scan(
     ...     lsa_window=(310.0, 10.0),
     ... )
     """
-    _require_positive(velocity, "velocity")
-    _require_non_negative(az_padding, "az_padding")
+    # Checked here, not only by the config built at the end: the crossing
+    # search, the leg quantiser and the Sun sweep compute with these first.
+    elevation = _require_finite(elevation, "elevation")
+    velocity = _require_positive(velocity, "velocity")
+    az_accel = _require_positive(az_accel, "az_accel")
+    # A padding wider than a full turn is meaningless; one below it but past
+    # the azimuth range reaches the bounds check as an AzimuthBoundsError.
+    az_padding = _require_non_negative(az_padding, "az_padding", maximum=AZ_PADDING_MAX_DEG)
     if lsa_window is not None and rising is not None:
         raise ValueError(
             "rising is not accepted with lsa_window: the sidereal window fixes both "

@@ -289,7 +289,8 @@ def resolve_offset(
     Raises
     ------
     ValueError
-        If both ``module`` and ``dx``/``dy`` are specified.
+        If both ``module`` and ``dx``/``dy`` are specified, or if ``dx`` or
+        ``dy`` is not finite.
 
     Examples
     --------

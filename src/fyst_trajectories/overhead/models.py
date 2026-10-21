@@ -1020,10 +1020,11 @@ class CalibrationPolicy:
     planet_cal_el_step : float or None
         Boresight-elevation spacing in degrees between consecutive passes.
         ``None`` (default) uses the planner default (the footprint eta
-        extent). Must be positive when given. Values smaller than the
-        footprint's elevation extent make adjacent pass windows overlap
-        in time, and the planner emits a
-        :class:`~fyst_trajectories.exceptions.PointingWarning` when they do.
+        extent). Must be positive when given. Values sufficiently below
+        the footprint's elevation extent can make adjacent pass windows
+        overlap in time; a pass that starts before the previous emitted
+        pass ends is not emitted, which leaves a gap in the recorded
+        ``pass_index``.
         Instrument/operations-team placeholder.
     planet_cal_footprint : str
         Prime-Cam module tag defining the base footprint the passes tile

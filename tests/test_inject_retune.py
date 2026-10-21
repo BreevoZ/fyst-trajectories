@@ -288,6 +288,9 @@ class TestInjectRetuneStaggered:
     modules can retune independently.
     """
 
+    @pytest.mark.filterwarnings(
+        "ignore:Staggered retunes overlap:fyst_trajectories.exceptions.PointingWarning"
+    )
     def test_staggered_retune_offset(self):
         """Different module_index values should produce retunes at different times."""
         traj = _make_trajectory(duration=300.0, timestep=0.1)
@@ -320,6 +323,9 @@ class TestInjectRetuneStaggered:
             expected = first_times[0] + i * expected_spacing
             np.testing.assert_allclose(first_times[i], expected, atol=0.15)
 
+    @pytest.mark.filterwarnings(
+        "ignore:Staggered retunes overlap:fyst_trajectories.exceptions.PointingWarning"
+    )
     def test_staggered_retune_coverage(self):
         """Combined science_mask from all 7 modules should have better coverage."""
         traj = _make_trajectory(duration=300.0, timestep=0.1)
@@ -368,6 +374,53 @@ class TestInjectRetuneStaggered:
 
         np.testing.assert_array_equal(result_default.scan_flag, result_explicit.scan_flag)
 
+    @staticmethod
+    def _most_modules_retuning_at_once(traj, retune_interval, retune_duration, n_modules):
+        """Return the largest number of modules flagged as retuning at any one sample."""
+        retuning = np.zeros(len(traj.times), dtype=int)
+        for module_index in range(n_modules):
+            result = inject_retune(
+                traj,
+                retune_interval=retune_interval,
+                retune_duration=retune_duration,
+                module_index=module_index,
+                n_modules=n_modules,
+            )
+            retuning += result.scan_flag == SCAN_FLAG_RETUNE
+        return int(retuning.max())
+
+    def test_duration_equal_to_the_stagger_neither_overlaps_nor_warns(self):
+        """At ``retune_interval / n_modules`` each module's retune ends as the next one starts.
+
+        35 s over 7 modules is a 5 s stagger, so 5 s retunes touch end to end:
+        one module retunes at a time and no advisory is due.
+        """
+        traj = _make_trajectory(duration=300.0, timestep=0.1)
+        most = self._most_modules_retuning_at_once(traj, 35.0, 5.0, 7)
+        assert most == 1
+
+    @pytest.mark.parametrize(
+        ("retune_interval", "retune_duration", "at_once"),
+        [(35.0, 5.5, 2), (30.0, 5.0, 2), (30.0, 10.0, 3)],
+        ids=["just-past-the-stagger", "30s-5s", "30s-10s"],
+    )
+    def test_duration_past_the_stagger_warns_how_many_modules_retune_at_once(
+        self, retune_interval, retune_duration, at_once
+    ):
+        """A longer retune is accepted, and the advisory names the most modules retuning at once.
+
+        Overlapping retunes are a legitimate configuration, so each call warns
+        and still places its retunes; the number quoted is the one the flags
+        show.
+        """
+        traj = _make_trajectory(duration=300.0, timestep=0.1)
+        with pytest.warns(PointingWarning, match="Staggered retunes overlap") as record:
+            most = self._most_modules_retuning_at_once(traj, retune_interval, retune_duration, 7)
+        assert most == at_once
+        messages = [str(w.message) for w in record]
+        assert len(messages) == 7
+        assert all(f"up to {at_once} of the 7 modules retune at once" in m for m in messages)
+
     def test_staggered_invalid_module_index(self):
         """module_index >= n_modules should raise ValueError."""
         traj = _make_trajectory(duration=120.0, timestep=0.1)
@@ -405,8 +458,7 @@ class TestInjectRetuneStaggered:
         traj = _make_trajectory(duration=120.0, timestep=0.1)
         events = [RetuneEvent(t_start=30.0, duration=5.0)]
 
-        with _warnings.catch_warnings():
-            _warnings.simplefilter("ignore", PointingWarning)
+        with pytest.warns(PointingWarning, match="is ignored when retune_events is supplied"):
             result = inject_retune(
                 traj, retune_events=events, retune_interval=30.0, retune_duration=45.0
             )

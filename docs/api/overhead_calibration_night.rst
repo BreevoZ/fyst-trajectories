@@ -111,9 +111,47 @@ Reading a Night Back
 
 .. autofunction:: fyst_trajectories.overhead.dispatch_sheet
 
+.. autofunction:: fyst_trajectories.overhead.dispatch_records
+
 .. autofunction:: fyst_trajectories.overhead.read_calibration_night_metadata
 
 .. autoclass:: fyst_trajectories.overhead.CalibrationNightMetadata
+   :members:
+
+NightRecord
+~~~~~~~~~~~
+
+.. autoclass:: fyst_trajectories.overhead.NightRecord
+   :members:
+
+VisitRecord
+~~~~~~~~~~~
+
+.. autoclass:: fyst_trajectories.overhead.VisitRecord
+   :members:
+
+SlewRecord
+~~~~~~~~~~
+
+.. autoclass:: fyst_trajectories.overhead.SlewRecord
+   :members:
+
+OperationRecord
+~~~~~~~~~~~~~~~
+
+.. autoclass:: fyst_trajectories.overhead.OperationRecord
+   :members:
+
+PassRecord
+~~~~~~~~~~
+
+.. autoclass:: fyst_trajectories.overhead.PassRecord
+   :members:
+
+IdleRecord
+~~~~~~~~~~
+
+.. autoclass:: fyst_trajectories.overhead.IdleRecord
    :members:
 
 Block Records

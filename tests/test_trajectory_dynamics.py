@@ -1290,6 +1290,38 @@ class TestJudgedSample:
             validate_trajectory_dynamics(site, az, el, times)
 
 
+class TestCoarseSampling:
+    """The advisory judges the samples it is given, not the motion between them."""
+
+    @pytest.mark.parametrize(
+        ("phase", "warns"), [(0.75, True), (0.25, False)], ids=["warns", "silent"]
+    )
+    def test_the_phase_of_a_1_s_grid_can_decide_the_verdict(self, site, phase, warns):
+        """One motion on two 1 s grids: a 1 deg/s azimuth ramp that stops at t = 10 s.
+
+        The elevation climbs through 60 deg at 0.5 deg/s and is 60.2 deg when the
+        ramp stops. The highest sample still moving at half the top speed is the
+        last one before the stop: at 9.75 s (el 60.075 deg, central speed
+        0.625 deg/s) on one grid, at 9.25 s (el 59.825 deg, 0.875 deg/s) on the
+        other, so one grid warns and the other does not. The samples after the
+        stop, up to el 65 deg, move at 0.375 deg/s or less and are not judged.
+        """
+        times = np.arange(20.0) + phase
+        az = 100.0 + np.minimum(times, 10.0)
+        el = 60.2 + 0.5 * (times - 10.0)
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            validate_trajectory_dynamics(site, az, el, times)
+        messages = [str(w.message) for w in record]
+        if not warns:
+            assert messages == []
+            return
+        # cos(60.075 deg) = 0.499 and 0.625 * 0.499 = 0.31 deg/s on sky.
+        assert len(messages) == 1
+        assert "to 0.31 deg/s" in messages[0]
+        assert "cos(el)=0.499)" in messages[0]
+
+
 class TestNoAzimuthMotion:
     """A trajectory whose azimuth spans less than 0.001 deg gets no high-elevation advisory.
 

@@ -45,6 +45,9 @@ _ALLOWED: dict[tuple[str, str], str] = {
     ("overhead.scheduler.helpers", "patterns.pong._pong_peak_offsets"): _PATTERN_REACH,
     ("overhead.scheduler.helpers", "planning._ce_geometry._compute_ce_az_range"): _PLANNER_SOLVE,
     ("overhead.scheduler.helpers", "planning._ce_geometry._compute_ce_duration"): _PLANNER_SOLVE,
+    ("overhead.simulation", "planning._sun_safety._check_trajectory_sun_safety"): (
+        "a rebuilt constant-elevation slice is screened with the planners' own Sun check"
+    ),
     ("planning._ce_geometry", "coordinates._threshold_crossings"): (
         "the crossing solve shares the rise and set search's threshold interpolation"
     ),

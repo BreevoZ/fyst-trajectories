@@ -80,6 +80,26 @@ def _read_time(value: str) -> Time:
 # helpers below) rather than adding a sidecar table or new columns.
 _RETUNE_EVENTS_META_KEY = "retune_events"
 
+_LIMIT_META_KEYS = (
+    "site_az_min",
+    "site_az_max",
+    "site_az_max_velocity",
+    "site_az_max_acceleration",
+    "site_el_min",
+    "site_el_max",
+    "site_el_max_velocity",
+    "site_el_max_acceleration",
+)
+
+
+def _limit_field(key: str) -> tuple[str, str]:
+    """Return the ``TelescopeLimits`` axis and the ``AxisLimits`` field a limit key holds.
+
+    A key of :data:`_LIMIT_META_KEYS` is ``site_<az|el>_<field>``.
+    """
+    _, axis, field = key.split("_", 2)
+    return {"az": "azimuth", "el": "elevation"}[axis], field
+
 
 def _encode_retune_events_for_json(meta: dict) -> dict:
     """Return a shallow copy of ``meta`` with ``retune_events`` JSON-encoded.
@@ -263,6 +283,12 @@ def write_timeline(
     table.meta["site_sun_enabled"] = timeline.site.sun_avoidance.enabled
     table.meta["site_sun_exclusion_radius"] = timeline.site.sun_avoidance.exclusion_radius
     table.meta["site_sun_warning_radius"] = timeline.site.sun_avoidance.warning_radius
+    # The axis limits, flat like the fields above, so a site whose limits are
+    # not FYST's reads back with its own.
+    limits = timeline.site.telescope_limits
+    for key in _LIMIT_META_KEYS:
+        axis, field = _limit_field(key)
+        table.meta[key] = float(getattr(getattr(limits, axis), field))
     # OverheadModel: persist ALL fields with overhead_ prefix.
     table.meta["overhead_retune_duration"] = timeline.overhead_model.retune_duration
     table.meta["overhead_pointing_cal_duration"] = timeline.overhead_model.pointing_cal_duration
@@ -314,14 +340,11 @@ def read_timeline(path: str | Path) -> ObservingTimeline:
 
     Block times are stored in UTC to millisecond precision, so a block's
     start and stop can shift by up to half a millisecond across a round
-    trip.
-    For a timeline whose times are UTC ``Time`` objects with astropy's
-    default ``precision`` and ``out_subfmt``, as the planners and
-    ``read_timeline`` hold them, the rendered forms (``str(timeline)``,
-    the summary and the dispatch sheet) are byte-identical either way,
-    except that on a day with a leap second the sheet's
-    ``scheduled_t0_unix`` can differ in its last digit; an equality test
-    on raw durations is not. A planet pass's ``search_start`` is two floats in
+    trip, and an equality test on raw durations is not exact.
+    The dispatch sheet and the dispatch records render every time and
+    duration from that stored form, so the sheet is byte-identical and the
+    records equal either way.
+    A planet pass's ``search_start`` is two floats in
     the ``block_meta_json`` column and reads back exactly, so the pass
     rebuilds the same from the file as from memory.
     Times may carry a ``+00:00`` or ``Z`` suffix, or none (older files);
@@ -340,8 +363,10 @@ def read_timeline(path: str | Path) -> ObservingTimeline:
     Warns
     -----
     PointingWarning
-        When the header describes a non-FYST site: telescope limits are
-        not persisted and are reset to FYST defaults.
+        When the header describes a non-FYST site but lacks the key of a
+        site field the reader restores (a file written before the header
+        held the axis limits lacks those eight): that field takes the FYST
+        value.
     """
     path = Path(path)
     table = Table.read(str(path), format="ascii.ecsv")
@@ -542,21 +567,29 @@ def read_timeline(path: str | Path) -> ObservingTimeline:
     )
 
 
+def _limits_from_meta(meta: dict, default: TelescopeLimits) -> TelescopeLimits:
+    """Rebuild the axis limits the header records, an absent key taking ``default``'s value."""
+    fields: dict[str, dict[str, float]] = {"azimuth": {}, "elevation": {}}
+    for key in _LIMIT_META_KEYS:
+        axis, field = _limit_field(key)
+        fields[axis][field] = float(meta.get(key, getattr(getattr(default, axis), field)))
+    return TelescopeLimits(**{axis: AxisLimits(**values) for axis, values in fields.items()})
+
+
 def _site_from_meta(meta: dict) -> Site:
     """Reconstruct a ``Site`` from ECSV table metadata.
 
     If ``site_lat``/``site_lon`` are present and match the FYST
     coordinates to 4 decimal places, the site is built from
-    ``get_fyst_site()`` so it has the full FYST default limits, with the
-    persisted ``nasmyth_port``/``plate_scale``/Sun settings applied on
-    top; the stored altitude is not compared, so a file carrying FYST
-    lat/lon with a different ``site_alt`` reads back with the FYST
-    5611.8 m value.
-    Otherwise a custom ``Site`` is constructed using the metadata
-    coordinates plus the persisted ``nasmyth_port``/``plate_scale``/sun
-    radii (older files without those keys fall back to FYST defaults).
-    ``telescope_limits`` are not persisted and are reset to FYST defaults;
-    a :class:`PointingWarning` is emitted in that case.
+    ``get_fyst_site()``, with the persisted axis limits,
+    ``nasmyth_port``/``plate_scale`` and Sun settings applied on top; the
+    stored altitude is not compared, so a file carrying FYST lat/lon with
+    a different ``site_alt`` reads back with the FYST 5611.8 m value.
+    Otherwise a custom ``Site`` is constructed from the metadata
+    coordinates and the same persisted fields.
+    A field whose key the header lacks takes the FYST value (the axis
+    limits, in a file written before the header held them); for a
+    non-FYST site a :class:`PointingWarning` names the missing keys.
     """
     fyst = get_fyst_site()
     lat = meta.get("site_lat")
@@ -573,8 +606,8 @@ def _site_from_meta(meta: dict) -> Site:
     alt = float(alt.to_value(u.m)) if isinstance(alt, u.Quantity) else float(alt)
 
     if round(lat, 4) == round(fyst.latitude, 4) and round(lon, 4) == round(fyst.longitude, 4):
-        # FYST limits, plus the per-run choices the writer
-        # persisted: a "left" port or changed Sun settings survive the trip.
+        # The FYST site, plus the per-run choices the writer persisted:
+        # lowered limits, a "left" port or changed Sun settings survive the trip.
         fyst_site = get_fyst_site(
             sun_exclusion_radius=float(
                 meta.get("site_sun_exclusion_radius", fyst.sun_avoidance.exclusion_radius)
@@ -586,41 +619,36 @@ def _site_from_meta(meta: dict) -> Site:
         )
         return dataclasses.replace(
             fyst_site,
+            telescope_limits=_limits_from_meta(meta, fyst.telescope_limits),
             nasmyth_port=str(meta.get("site_nasmyth_port", fyst.nasmyth_port)),
             plate_scale=float(meta.get("site_plate_scale", fyst.plate_scale)),
         )
 
-    # Non-FYST site: restore the persisted fields below; warn that
-    # telescope_limits are not persisted (a consumer recomputing pose or
-    # feasibility from the loaded limits needs to know they are FYST defaults).
-    warnings.warn(
-        "Reconstructing a non-FYST Site from ECSV: telescope_limits are not "
-        "persisted and have been reset to FYST defaults. nasmyth_port, "
-        "plate_scale and sun-avoidance radii are restored from metadata when "
-        "present (older files fall back to FYST defaults).",
-        PointingWarning,
-        stacklevel=3,
+    # Non-FYST site: a field the header lacks takes the FYST value, which a
+    # consumer recomputing pose or feasibility from the loaded site needs to know.
+    restored = (
+        *_LIMIT_META_KEYS,
+        "site_nasmyth_port",
+        "site_plate_scale",
+        "site_sun_enabled",
+        "site_sun_exclusion_radius",
+        "site_sun_warning_radius",
     )
+    missing = [key for key in restored if key not in meta]
+    if missing:
+        warnings.warn(
+            f"Reconstructing a non-FYST Site from ECSV whose header lacks {', '.join(missing)}: "
+            "the Site fields they hold take the FYST values.",
+            PointingWarning,
+            stacklevel=3,
+        )
     return Site(
         name=str(meta.get("site_name", "custom")),
         description=str(meta.get("site_description", "")),
         latitude=lat,
         longitude=lon,
         elevation=alt,
-        telescope_limits=TelescopeLimits(
-            azimuth=AxisLimits(
-                min=fyst.telescope_limits.azimuth.min,
-                max=fyst.telescope_limits.azimuth.max,
-                max_velocity=fyst.telescope_limits.azimuth.max_velocity,
-                max_acceleration=fyst.telescope_limits.azimuth.max_acceleration,
-            ),
-            elevation=AxisLimits(
-                min=fyst.telescope_limits.elevation.min,
-                max=fyst.telescope_limits.elevation.max,
-                max_velocity=fyst.telescope_limits.elevation.max_velocity,
-                max_acceleration=fyst.telescope_limits.elevation.max_acceleration,
-            ),
-        ),
+        telescope_limits=_limits_from_meta(meta, fyst.telescope_limits),
         sun_avoidance=SunAvoidanceConfig(
             enabled=bool(meta.get("site_sun_enabled", fyst.sun_avoidance.enabled)),
             exclusion_radius=float(
@@ -684,6 +712,7 @@ _KNOWN_META_KEYS = frozenset(
         "site_sun_enabled",
         "site_sun_exclusion_radius",
         "site_sun_warning_radius",
+        *_LIMIT_META_KEYS,
         # OverheadModel.
         "overhead_retune_duration",
         "overhead_pointing_cal_duration",

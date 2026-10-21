@@ -11,7 +11,8 @@ it loops over (:func:`list_candidates`, :func:`plan_visit`,
 plan, inspect, discard and re-plan a visit interactively. The result is
 an ordinary
 :class:`~fyst_trajectories.overhead.ObservingTimeline`, read back by
-:func:`summarize_calibration_night` and :func:`dispatch_sheet`.
+:func:`summarize_calibration_night`, :func:`dispatch_sheet` and
+:func:`dispatch_records`.
 """
 
 from .night import plan_calibration_night
@@ -24,7 +25,14 @@ from .policy import (
 )
 from .reporting import (
     BodySummary,
+    IdleRecord,
+    NightRecord,
     NightSummary,
+    OperationRecord,
+    PassRecord,
+    SlewRecord,
+    VisitRecord,
+    dispatch_records,
     dispatch_sheet,
     summarize_calibration_night,
 )
@@ -53,18 +61,25 @@ __all__ = [
     "Candidate",
     "DEFAULT_SCAN_TABLES",
     "ElevationBin",
+    "IdleRecord",
     "NightContext",
+    "NightRecord",
     "NightState",
     "NightSummary",
+    "OperationRecord",
+    "PassRecord",
     "ScanOverrides",
     "ScanParameterTable",
     "ScriptedSelection",
     "SelectionRule",
+    "SlewRecord",
     "TuningPolicy",
     "VisitPlan",
     "VisitPlanner",
+    "VisitRecord",
     "advance_idle",
     "commit_visit",
+    "dispatch_records",
     "dispatch_sheet",
     "list_candidates",
     "load_scan_tables",

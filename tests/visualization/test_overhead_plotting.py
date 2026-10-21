@@ -5,8 +5,6 @@ pixel-perfect output. The whole file skips when matplotlib is not installed
 (optional extra).
 """
 
-import warnings
-
 import numpy as np
 import pytest
 from astropy import units as u
@@ -431,8 +429,6 @@ def test_sky_auto_pairs_end_to_end():
         start_time="2026-06-15T07:30:00",
         end_time="2026-06-15T09:30:00",
     )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        fig = plot_sky_coverage(timeline, show=False)
+    fig = plot_sky_coverage(timeline, show=False)
     assert isinstance(fig, Figure)
     assert len(fig.axes[0].lines) == timeline.n_science_scans

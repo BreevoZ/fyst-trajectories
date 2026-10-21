@@ -94,9 +94,9 @@ def _mark_simulator_tier(items):
     A test module is classified by the modules it imports (``_tiers``, the one
     boundary definition), not by the directory it sits in. A module that
     already marks items itself owns its classification: the documentation
-    guards split their parameters page by page, and two files mark the single
-    test in them that reaches into the simulator, so a blanket module-level
-    mark would move their library-tier tests to the wrong job.
+    guards split their parameters page by page, and a few files mark the
+    single test in them that reaches into the simulator, so a blanket
+    module-level mark would move their library-tier tests to the wrong job.
     """
     by_module = defaultdict(list)
     for item in items:

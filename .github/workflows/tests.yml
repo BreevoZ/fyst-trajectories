@@ -6,9 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+# Every job pins ubuntu-24.04, what ubuntu-latest resolved to before its
+# 2026-10-19 migration to Ubuntu 26, so a runner-image change is a deliberate
+# upgrade here rather than a drift under a green suite; the Python 3.10 legs
+# and the 3.10-pinned typing job need a setup-python build for the image.
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
@@ -34,7 +38,7 @@ jobs:
   # Node as a wheel, so nothing is downloaded at run time.
   typing:
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
@@ -66,7 +70,7 @@ jobs:
   # token configured, closed.
   fast-tests:
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
@@ -97,7 +101,7 @@ jobs:
 
   offline-tests:
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
@@ -127,7 +131,7 @@ jobs:
           fail_ci_if_error: false
 
   slow-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [fast-tests, offline-tests]
 
     steps:
@@ -166,7 +170,7 @@ jobs:
         timeout-minutes: 60
 
   oracle-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [fast-tests, offline-tests]
 
     # Secrets cannot be read from an ``if:`` expression, so the token is
@@ -250,7 +254,7 @@ jobs:
       # backs the "cone" and "cad" models. It is a private CCAT repository, so
       # it installs only where a read-only deploy token is configured as the
       # SUN_AVOIDANCE_DEPLOY_TOKEN repository secret. The pin is the revision
-      # the adapter and the parity fixtures are built against
+      # the adapter and the record-replay fixtures are built against
       # (sun_models.SUN_AVOIDANCE_PINNED_SHA); bump both together. If the
       # token route is refused, the fallback is a wheel vendored into the
       # repository and installed here instead; it has not been built.
@@ -260,24 +264,26 @@ jobs:
 
       # Without the library this surface skips green and says nothing: the 17
       # record-replay tests that detect behaviour drift at the pinned
-      # revision, the 6 end-to-end CAD tests (slew safety, the simulator's
-      # Sun-model seam, the sky-view and visibility renderers, and the
-      # sky-view documentation figure), 9 of the 122 executable documentation
+      # revision, the 7 end-to-end CAD tests (slew safety, the simulator's
+      # Sun-model seam, the sky-view and visibility renderers, the sky-view
+      # documentation figure and the CAD model's protocol membership), 9 of
+      # the 123 executable documentation
       # blocks (including four of the six on the sun-avoidance page) and 2
       # doctests. No other job installs the library, so this step is the only
       # place any of them runs. The doc
       # guards drop their gated blocks with a silent ``continue``, so their
       # pass counts are identical either way; this step is the only place the
-      # gap is stated. The offline half of the parity fixture, which pins both
+      # gap is stated. The offline half of the record-replay fixture, which pins both
       # SHAs, runs in the fast job regardless.
       - name: Run sun-avoidance oracle tests
         run: |
           if [ -z "$SUN_AVOIDANCE_DEPLOY_TOKEN" ]; then
-            echo "::warning title=sun-avoidance not installed::No SUN_AVOIDANCE_DEPLOY_TOKEN secret: skipping 17 record-replay tests, 6 end-to-end CAD tests, 9 documentation blocks and 2 doctests that need the shared library. Only the scalar sun model is covered by this run."
+            echo "::warning title=sun-avoidance not installed::No SUN_AVOIDANCE_DEPLOY_TOKEN secret: skipping 17 record-replay tests, 7 end-to-end CAD tests, 9 documentation blocks and 2 doctests that need the shared library. Only the scalar sun model is covered by this run."
             exit 0
           fi
           python -c "import sun_avoidance; import fyst_trajectories.sun_models as m; print('sun-avoidance oracle OK, pinned', m.SUN_AVOIDANCE_PINNED_SHA)"
-          pytest tests/test_sun_models_live.py tests/test_doc_examples_rst.py \
+          pytest tests/test_sun_models_live.py tests/test_sun_protocols.py \
+            tests/test_doc_examples_rst.py \
             tests/test_docstring_examples.py tests/test_slew_safety.py \
             tests/overhead/test_sun_model_seam.py \
             tests/visualization/test_sky_view_plotting.py \

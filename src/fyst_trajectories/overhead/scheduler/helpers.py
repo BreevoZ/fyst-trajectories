@@ -5,13 +5,14 @@ Dependency-free (no scheduler state); consumed by
 """
 
 import math
+import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
 from astropy.time import Time, TimeDelta
 
 from ...coordinates import Coordinates
-from ...exceptions import PointingError
+from ...exceptions import PointingError, PointingWarning
 from ...patterns import PongScanConfig, compute_pong_period
 
 # Private pattern reuse, on purpose: a pong or daisy visit is sized by where
@@ -38,6 +39,10 @@ from ..utils import _normalize_az
 
 if TYPE_CHECKING:
     from ...sun_protocols import SunSafePredicate
+
+#: The rate a field's hour angle grows, deg/s: one turn per sidereal day
+#: (86164.0905 s).
+_SIDEREAL_RATE_DEG_S = 360.0 / 86164.0905
 
 #: Cached corridor hits are only trusted for anchors at least this many
 #: seconds before the pass's opening crossing: the planner's 30 s-step
@@ -185,7 +190,15 @@ def _ce_crossing_corridor(
         height=patch.height,
     )
     try:
-        t_open, t_close, _ = _compute_ce_duration(field, 0.0, elevation, coords, start_time, rising)
+        # The solve's advisories describe the pass a block records, so, as
+        # for a science subscan's probe build, they are not raised here: a
+        # rebuild of the timeline raises them, running the same solve from
+        # the block's anchor.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", PointingWarning)
+            t_open, t_close, _ = _compute_ce_duration(
+                field, 0.0, elevation, coords, start_time, rising
+            )
     except PointingError:
         cache[key] = ("miss", start_time)
         return None
@@ -347,10 +360,11 @@ def _pattern_el_bounds(
     elevation it touches. The corners are placed on the sky and transformed
     exactly as the planner places the pattern. The highest point can lie
     along an edge, so it is bounded by the circle about the centre through
-    the corners. The bounds hold whatever the pattern's phase, which is not
-    known before the slew; a pong passes near a given corner only once a
-    period, so its bound can sit up to a period's drift below the
-    trajectory it stands for.
+    the corners, ``centre + reach``, which is not clamped at 90: at 90 or
+    more the circle holds the zenith. The bounds hold whatever the
+    pattern's phase, which is not known before the slew; a pong passes near
+    a given corner only once a period, so its bound can sit up to a
+    period's drift below the trajectory it stands for.
 
     Parameters
     ----------
@@ -364,7 +378,9 @@ def _pattern_el_bounds(
     Returns
     -------
     tuple of numpy.ndarray
-        ``(lowest, highest)`` elevation in degrees at each time.
+        ``(lowest, highest)`` in degrees at each time: the lowest elevation
+        of the pattern and the top of the circle that bounds it, above 90
+        when that circle holds the zenith.
     """
     n_t = len(times)
     if patch.scan_type == "pong":
@@ -398,7 +414,29 @@ def _pattern_el_bounds(
         )
         centre = np.asarray(centre, dtype=float)
         lowest = centre - reach
-    return lowest, np.minimum(centre + reach, 90.0)
+    return lowest, centre + reach
+
+
+def _transit_offset(patch: ObservingPatch, start_time: Time, coords: Coordinates) -> float:
+    """Return the seconds from ``start_time`` to the field centre's next transit.
+
+    The centre's hour angle at ``start_time`` is read off its azimuth and
+    elevation, ``H = atan2(-sin(az) cos(el), cos(lat) sin(el) - sin(lat)
+    cos(el) cos(az))``, so the transit is where the centre's elevation, and
+    with it the top of the circle that bounds the pattern, peaks in the
+    frame the bounds are computed in; the hour angle grows at the sidereal
+    rate.
+    """
+    az, el = coords.radec_to_altaz(patch.ra_center, patch.dec_center, start_time)
+    az, el = math.radians(float(az)), math.radians(float(el))
+    lat = math.radians(coords.site.latitude)
+    hour_angle = math.degrees(
+        math.atan2(
+            -math.sin(az) * math.cos(el),
+            math.cos(lat) * math.sin(el) - math.sin(lat) * math.cos(el) * math.cos(az),
+        )
+    )
+    return (-hour_angle % 360.0) / _SIDEREAL_RATE_DEG_S
 
 
 def _time_inside_el_limits(
@@ -415,18 +453,24 @@ def _time_inside_el_limits(
     centre, must stay within the site's elevation limits, outside which the
     planner refuses a trajectory, from ``start_time + lead`` on:
     ``lead`` is the boundary retune booked before the subscan, during which
-    the telescope holds the field centre and no pattern runs. The bounds
+    the telescope holds the field centre and no pattern runs. The circle
+    that bounds the pattern must also exclude the zenith,
+    ``centre + reach < 90`` with no margin: a track passing round the
+    zenith winds its azimuth through whole turns, past the azimuth limits,
+    which the planner refuses too. The bounds
     are sampled every ``step_seconds`` from then up to *max_duration* in
-    one vectorised transform, and the first sample outside is refined by
-    bisection between it and the last sample inside, returning the last
-    time verified inside (conservative by construction, to within 0.3 s
-    for the default step).
+    one vectorised transform, together with the field centre's transit
+    (:func:`_transit_offset`) when it falls in that span: the circle peaks
+    there, so it cannot hold the zenith between two samples unseen. The
+    first sample outside is refined by bisection between it and the last
+    sample inside, returning the last time verified inside (conservative
+    by construction, to within 0.3 s for the default step).
 
     Returns the window from *start_time*, ``lead`` included: *max_duration*
     when the pattern stays inside throughout, and ``0.0`` when it is not
     inside at ``start_time + lead`` (a field whose pattern edge has not yet
-    risen above the lower limit, or has already set) or ``lead`` leaves no
-    time.
+    risen above the lower limit, or has already set, or whose circle holds
+    the zenith) or ``lead`` leaves no time.
     """
     limits = coords.site.telescope_limits.elevation
     if lead >= max_duration:
@@ -436,10 +480,13 @@ def _time_inside_el_limits(
         lowest, highest = _pattern_el_bounds(
             patch, start_time + TimeDelta(offsets, format="sec"), coords
         )
-        return (lowest >= limits.min) & (highest <= limits.max)
+        return (lowest >= limits.min) & (highest <= limits.max) & (highest < 90.0)
 
     n_steps = max(2, int((max_duration - lead) / step_seconds) + 1)
     dt = np.linspace(lead, max_duration, n_steps)
+    transit = _transit_offset(patch, start_time, coords)
+    if lead <= transit <= max_duration:
+        dt = np.union1d(dt, [transit])
     outside = np.flatnonzero(~inside(dt))
     if outside.size == 0:
         return max_duration

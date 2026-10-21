@@ -6,7 +6,9 @@ are rejected with appropriate error messages.
 
 import warnings
 from dataclasses import FrozenInstanceError
+from decimal import Decimal
 
+import numpy as np
 import pytest
 
 from fyst_trajectories import PointingWarning
@@ -18,7 +20,9 @@ from fyst_trajectories.patterns import (
     PlanetTrackConfig,
     PongAltAzScanConfig,
     PongScanConfig,
+    SatelliteTrackConfig,
     ScanConfig,
+    SiderealTrackConfig,
 )
 
 
@@ -379,13 +383,15 @@ class TestConfigWarnings:
             )
 
 
-class TestConfigsRejectNonFiniteValues:
-    """A NaN or infinite field is refused at construction, not much later.
+class TestConfigFloatFields:
+    """A float field is checked at construction and holds the float its check returned.
 
-    A bare ``value <= 0`` check lets both through: every comparison with NaN
-    is False, and infinity is positive. The bad value then surfaces far away,
-    a NaN velocity dying inside the leg quantiser as ``cannot convert float
-    NaN to integer``, with nothing pointing back at the config.
+    A NaN, an infinity or a value that is not a real number is refused there,
+    not much later. A bare ``value <= 0`` check lets NaN and infinity through:
+    every comparison with NaN is False, and infinity is positive. The bad
+    value then surfaces far away, a NaN velocity dying inside the leg
+    quantiser as ``cannot convert float NaN to integer``, with nothing
+    pointing back at the config.
     """
 
     @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
@@ -476,6 +482,12 @@ class TestConfigsRejectNonFiniteValues:
             avoidance_radius=0.0,
             start_acceleration=0.5,
         ),
+        LinearMotionConfig: dict(
+            timestep=0.1, az_start=180.0, el_start=45.0, az_velocity=0.1, el_velocity=0.0
+        ),
+        SiderealTrackConfig: dict(timestep=0.1),
+        PlanetTrackConfig: dict(timestep=0.1, body="jupiter"),
+        SatelliteTrackConfig: dict(timestep=0.1, body="titan"),
     }
 
     @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
@@ -498,6 +510,54 @@ class TestConfigsRejectNonFiniteValues:
         kwargs = {**self._VALID_KWARGS[config_cls], field: bad}
         with pytest.raises(ValueError, match=f"{field} must be a finite number"):
             config_cls(**kwargs)
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["0.5", None, 10**400, True, np.True_, np.array([0.5]), np.complex128(0.5)],
+        ids=["text", "none", "int-1e400", "bool", "numpy-bool", "array", "numpy-complex"],
+    )
+    @pytest.mark.parametrize(
+        ("config_cls", "field"),
+        [
+            (PongScanConfig, "width"),
+            (PongScanConfig, "angle"),
+            (DaisyScanConfig, "avoidance_radius"),
+            (PongAltAzScanConfig, "el_center"),
+        ],
+        ids=["positive", "free", "non-negative", "el-center"],
+    )
+    def test_a_non_number_is_refused_by_name(self, config_cls, field, bad):
+        """Text, ``None``, a huge integer, a bool, an array or a complex is refused by name.
+
+        ``float`` would read a bool as 0 or 1, a one-element array as its
+        element and a NumPy complex as its real part, so none of them may
+        stand in for an angle or a rate.
+        """
+        kwargs = {**self._VALID_KWARGS[config_cls], field: bad}
+        with pytest.raises(ValueError, match=f"^{field} must be a real number"):
+            config_cls(**kwargs)
+
+    @pytest.mark.parametrize(
+        "value", [complex(0.5, 0.0), np.complex128(0.5)], ids=["complex", "numpy-complex"]
+    )
+    def test_a_complex_number_is_refused_alike(self, value):
+        """A Python complex and a NumPy complex get the same refusal."""
+        kwargs = {**self._VALID_KWARGS[PongScanConfig], "width": value}
+        with pytest.raises(ValueError, match=r"^width must be a real number, got "):
+            PongScanConfig(**kwargs)
+
+    @pytest.mark.parametrize("config_cls", list(_VALID_KWARGS), ids=lambda cls: cls.__name__)
+    def test_a_decimal_field_is_stored_as_its_float(self, config_cls):
+        """Each float field holds the float a ``Decimal`` equals.
+
+        ``num_terms`` stays an int and ``body`` stays text.
+        """
+        kwargs = self._VALID_KWARGS[config_cls]
+        decimals = {k: Decimal(str(v)) if isinstance(v, float) else v for k, v in kwargs.items()}
+        config = config_cls(**decimals)
+        for name, value in kwargs.items():
+            stored = getattr(config, name)
+            assert type(stored) is type(value) and stored == value, name
 
 
 class TestLinearMotionConfigValidation:

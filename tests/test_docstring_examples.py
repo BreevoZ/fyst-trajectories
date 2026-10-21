@@ -104,24 +104,22 @@ MODULE_NAMES = [_module_param(name) for name in _module_names()]
 def _doctest_globs():
     """Build the ambient namespace docstring examples assume: site, coords, a trajectory."""
     site = get_fyst_site()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", PointingWarning)
-        trajectory = (
-            TrajectoryBuilder(site)
-            .with_config(
-                ConstantElScanConfig(
-                    timestep=0.1,
-                    az_start=120.0,
-                    az_stop=145.0,
-                    elevation=45.0,
-                    az_speed=1.0,
-                    az_accel=0.5,
-                )
+    trajectory = (
+        TrajectoryBuilder(site)
+        .with_config(
+            ConstantElScanConfig(
+                timestep=0.1,
+                az_start=120.0,
+                az_stop=145.0,
+                elevation=45.0,
+                az_speed=1.0,
+                az_accel=0.5,
             )
-            .duration(700.0)
-            .starting_at(Time("2026-03-15T04:00:00", scale="utc"))
-            .build()
         )
+        .duration(700.0)
+        .starting_at(Time("2026-03-15T04:00:00", scale="utc"))
+        .build()
+    )
     return {
         "site": site,
         "coords": Coordinates(site),

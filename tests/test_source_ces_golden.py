@@ -363,6 +363,10 @@ def _run_case(case: _Case) -> tuple[dict[str, Any], dict[str, Any]]:
     }[case.entry]
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
+        # A ResourceWarning is garbage collection closing a file some earlier
+        # test left open (an ephemeris kernel astropy's cache dropped); it lands
+        # in whichever test is running and is never one of the planners' own.
+        warnings.simplefilter("ignore", ResourceWarning)
         try:
             result = _call(entry, case.kwargs)
         except Exception as exc:  # noqa: BLE001 - every refusal is recorded and compared

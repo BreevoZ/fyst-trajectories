@@ -160,7 +160,7 @@ def _compute_ce_duration(
     Raises
     ------
     ValueError
-        If ``step_seconds`` is not positive.
+        If ``max_search_hours`` or ``step_seconds`` is not positive.
     PointingError
         If elevation crossings cannot be found in the search window, if the
         two field edges cross on different passes, or if the field lies
@@ -174,7 +174,8 @@ def _compute_ce_duration(
     are one. See the module docstring for why that coupling is deliberate
     and the function stays private.
     """
-    _require_positive(step_seconds, "step_seconds")
+    max_search_hours = _require_positive(max_search_hours, "max_search_hours")
+    step_seconds = _require_positive(step_seconds, "step_seconds")
 
     corners = _field_region_corners(
         field.ra_center, field.dec_center, field.width, field.height, angle
@@ -408,11 +409,11 @@ def _compute_ce_duration_from_lsa(
         raise ValueError(
             f"lsa_window has equal endpoints ({min_lsa}); refusing zero-duration window"
         )
-    _require_positive(max_search_hours, "max_search_hours")
+    max_search_hours = _require_positive(max_search_hours, "max_search_hours")
     # 0 makes the arange below divide by zero; a negative step makes it
     # empty, and the crossing search then reports "no crossing found"
     # over a horizon it never sampled.
-    _require_positive(step_seconds, "step_seconds")
+    step_seconds = _require_positive(step_seconds, "step_seconds")
 
     duration_deg = (max_lsa - min_lsa) % 360.0
     duration_hours = duration_deg / 15.0

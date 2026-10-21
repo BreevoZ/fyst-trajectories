@@ -37,6 +37,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from ._validation import _require_finite
 from .exceptions import OffsetInversionError
 from .site import Site
 from .trajectory import Trajectory
@@ -54,7 +55,9 @@ class InstrumentOffset:
     focal_plane_rotation angle; for the az/el projections this is the
     mechanical Nasmyth rotation (see :func:`compute_focal_plane_rotation`).
     At zero rotation, dx corresponds to the cross-elevation direction and
-    dy to the elevation direction.
+    dy to the elevation direction. ``dx``, ``dy`` and ``instrument_rotation``
+    take any real number (an ``int``, a ``Decimal``, a NumPy scalar or a 0-d
+    array, for example) and are stored as floats.
 
     Parameters
     ----------
@@ -70,6 +73,13 @@ class InstrumentOffset:
         Fixed rotation of the instrument relative to the Nasmyth flange,
         in degrees. This accounts for instruments that are mounted at a
         rotational offset from the default orientation. Default is 0.0.
+
+    Raises
+    ------
+    ValueError
+        If ``dx``, ``dy`` or ``instrument_rotation`` is a ``bool``, an array
+        of one or more dimensions, text or ``None``, or is not finite (a NaN
+        or an infinity).
 
     Examples
     --------
@@ -93,6 +103,14 @@ class InstrumentOffset:
     dy: float
     name: str | None = None
     instrument_rotation: float = 0.0
+
+    def __post_init__(self) -> None:
+        # Frozen dataclass: object.__setattr__ stores the float each check
+        # returns, so the offset computes and hashes with the number it checked.
+        for field_name in ("dx", "dy", "instrument_rotation"):
+            object.__setattr__(
+                self, field_name, _require_finite(getattr(self, field_name), field_name)
+            )
 
     @property
     def dx_deg(self) -> float:
@@ -136,6 +154,14 @@ class InstrumentOffset:
         InstrumentOffset
             Offset with dx, dy converted to arcminutes.
 
+        Raises
+        ------
+        ValueError
+            If ``x_mm``, ``y_mm``, ``plate_scale`` or ``instrument_rotation``
+            is a ``bool``, an array of one or more dimensions, text or
+            ``None``, or is not finite, or if the converted ``dx`` or ``dy``
+            is not finite.
+
         Examples
         --------
         >>> offset = InstrumentOffset.from_focal_plane(
@@ -147,6 +173,11 @@ class InstrumentOffset:
         >>> print(f"{offset.dy:.1f} arcmin")
         -106.8 arcmin
         """
+        # Checked first: the arithmetic would read a bool as 0 or 1 and raise
+        # a TypeError for text, None or a Decimal.
+        x_mm = _require_finite(x_mm, "x_mm")
+        y_mm = _require_finite(y_mm, "y_mm")
+        plate_scale = _require_finite(plate_scale, "plate_scale")
         dx_arcmin = x_mm * plate_scale / 60.0
         dy_arcmin = y_mm * plate_scale / 60.0
         return cls(
@@ -511,8 +542,9 @@ def detector_to_boresight(
         1e-6 deg of the pole (+/-90 deg), where azimuth is degenerate, or
         if the iterative refinement fails to converge.
     ValueError
-        If ``det_az``, ``det_el``, ``focal_plane_rotation`` or the offset's
-        ``dx`` or ``dy`` holds a NaN or an infinity.
+        If ``det_az``, ``det_el`` or ``focal_plane_rotation`` holds a NaN or
+        an infinity (an :class:`InstrumentOffset` refuses one at
+        construction).
 
     Examples
     --------
@@ -531,8 +563,6 @@ def detector_to_boresight(
         ("det_az", det_az),
         ("det_el", det_el),
         ("focal_plane_rotation", focal_plane_rotation),
-        ("offset.dx", offset.dx),
-        ("offset.dy", offset.dy),
     ):
         if not np.all(np.isfinite(value)):
             raise ValueError(f"detector_to_boresight: {name} must be finite (no NaN or infinity)")
@@ -737,9 +767,6 @@ def apply_detector_offset(
         If the inversion hits the near-pole azimuth degeneracy or fails to
         converge (see :func:`detector_to_boresight`), or the boresight
         elevation the Nasmyth term is evaluated at does not settle.
-    ValueError
-        If the offset's ``dx`` or ``dy``, or the ``instrument_rotation`` of
-        a nonzero offset, holds a NaN or an infinity.
 
     Notes
     -----

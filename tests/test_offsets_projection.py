@@ -20,12 +20,10 @@ from fyst_trajectories.offsets import (
     _INVERSE_EARLY_EXIT_THRESHOLD,
     _INVERSE_FAILURE_THRESHOLD,
     InstrumentOffset,
-    apply_detector_offset,
     boresight_to_detector,
     detector_to_boresight,
     sky_to_focal_plane,
 )
-from fyst_trajectories.trajectory import Trajectory
 
 
 class TestBoresightToDetector:
@@ -494,17 +492,6 @@ class TestDetectorToBoresightNonFinite:
         with pytest.raises(ValueError, match=name):
             detector_to_boresight(offset=InstrumentOffset(dx=5.0, dy=3.0), **kwargs)
 
-    @pytest.mark.parametrize(
-        ("offset", "name"),
-        [
-            (InstrumentOffset(dx=np.nan, dy=3.0), "offset.dx"),
-            (InstrumentOffset(dx=5.0, dy=np.inf), "offset.dy"),
-        ],
-    )
-    def test_non_finite_offset_raises(self, offset, name):
-        with pytest.raises(ValueError, match=name):
-            detector_to_boresight(180.0, 45.0, offset, focal_plane_rotation=0.0)
-
     def test_one_nan_sample_does_not_hide_an_unconverged_one(self):
         # 100 x 60 deg at el 60 does not converge on its own; beside a NaN it
         # was returned with an elevation of about 857 deg.
@@ -519,20 +506,11 @@ class TestDetectorToBoresightNonFinite:
         # residual is NaN and the inverse must refuse rather than return NaN.
         offset = InstrumentOffset(dx=1e308, dy=0.0)
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
+            warnings.filterwarnings(
+                "ignore", message="(overflow|invalid value) encountered", category=RuntimeWarning
+            )
             with pytest.raises(OffsetInversionError, match="converge"):
                 detector_to_boresight(180.0, 45.0, offset, focal_plane_rotation=0.0)
-
-    def test_apply_detector_offset_names_the_non_finite_field(self, site):
-        trajectory = Trajectory(
-            times=np.array([0.0, 1.0, 2.0]),
-            az=np.array([180.0, 180.1, 180.2]),
-            el=np.full(3, 45.0),
-            az_vel=np.full(3, 0.1),
-            el_vel=np.zeros(3),
-        )
-        with pytest.raises(ValueError, match="offset.dx"):
-            apply_detector_offset(trajectory, InstrumentOffset(dx=np.nan, dy=3.0), site=site)
 
 
 class TestRotationKeyword:

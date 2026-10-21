@@ -240,11 +240,15 @@ def compute_source_ces_params(
     az_accel : float, optional
         Azimuth acceleration in deg/s^2. Default 1.0.
     az_padding : float, optional
-        Extra azimuth padding on each side, in degrees. Default 0.5. Must be non-negative.
+        Extra azimuth padding on each side, in degrees. Default 0.5. Must lie in ``[0, 360]``.
     az_branch : float, optional
         Centre of azimuth wrap branch.
     allow_partial : bool, optional
         If ``True``, downgrade footprint-not-fully-covered to a warning.
+        With ``start_time`` and no ``el_bore``, ``el_bore`` is derived the
+        same either way and puts the cover's near side after the anchor,
+        so the clip can fall only where the source turns before it
+        crosses the whole cover.
     v_az : float, optional
         Override the solved azimuth drift rate (deg/s; a mount-frame
         azimuth coordinate rate, not an on-sky speed).
@@ -290,17 +294,20 @@ def compute_source_ces_params(
     Returns
     -------
     SourceCESComputedParams
-        Scalar parameters describing the planned source-CES - the same
-        dict that ``plan_source_ces(...).computed_params`` returns.
+        Scalar parameters describing the planned source-CES, a plain dict
+        equal to ``plan_source_ces(...).computed_params`` (the block's copy
+        is read-only).
 
     Raises
     ------
     ValueError
-        On incompatible argument combinations, a non-positive step, speed,
-        acceleration, throw or dwell, a negative ``az_padding``, a reversed
-        window, a ``dwell`` shorter than ``sampling_step_seconds``, or a
-        footprint whose cover is a single point with ``az_padding=0`` and
-        no ``az_throw`` (a sweep with no width at any time).
+        On incompatible argument combinations, a step, speed, acceleration,
+        throw or dwell that is not a positive real number (a ``bool``, an
+        array of one or more dimensions and text are not real numbers here),
+        an ``az_padding`` that is not a real number in ``[0, 360]``, a
+        reversed window, a ``dwell`` shorter than ``sampling_step_seconds``,
+        or a footprint whose cover is a single point with ``az_padding=0``
+        and no ``az_throw`` (a sweep with no width at any time).
     DwellExceedsCrossingError
         When ``dwell`` is longer than the solved footprint crossing. A
         :class:`~fyst_trajectories.exceptions.PointingError` subclass that
@@ -330,8 +337,9 @@ def compute_source_ces_params(
     PointingError
         When the source reaches no vertex of the footprint's cover: with
         ``allow_partial=True``, or when ``el_bore`` is derived from a
-        ``start_time`` anchor too near culmination for the source to climb
-        onto the footprint. When it crosses the cover at a single azimuth
+        ``start_time`` anchor whose explicit ``mode`` runs against the
+        source's motion there and the source turns before it climbs onto
+        the footprint. When it crosses the cover at a single azimuth
         (one vertex of a partial cover in reach, coincident vertices, or
         vertices an explicit ``v_az`` lines up) with ``az_padding=0`` and no
         ``az_throw``, so the swept window has no width. When the Nelder-Mead
@@ -431,7 +439,7 @@ def compute_source_ces_params(
         min(cp["az_start"], cp["az_start"] + cp["az_throw"]),
         max(cp["az_start"], cp["az_start"] + cp["az_throw"]),
         cp["az_speed"],
-        az_accel,
+        core.az_accel,
     )
     # The executed trajectory applies ``az + v_az*times`` (see
     # ``plan_source_ces``), so the linear drift shifts the track in a
@@ -559,8 +567,14 @@ def plan_source_ces(
         default 24 h horizon. When ``el_bore`` is omitted it is derived
         so the resolved start typically lands within about a minute
         after the anchor (the window opens at the anchor, so the pass
-        cannot begin earlier). When ``mode`` is omitted it is taken
-        from the sign of the source's elevation slope at the anchor.
+        cannot begin earlier). For a cover that lies beyond the boresight
+        along the source's motion (above it while the source rises,
+        below it while it sets, as an inner-ring module's can),
+        ``el_bore`` is derived just ahead of the source's elevation at the
+        anchor, and the pass starts when the source reaches the cover,
+        minutes after the anchor for an inner-ring module. When ``mode``
+        is omitted it is taken from the sign of the source's elevation
+        slope at the anchor.
         Anchors within a small drift rate of transit are rejected with
         :class:`~fyst_trajectories.exceptions.TargetNotObservableError`; anchor
         away from transit or pass ``el_bore`` explicitly.
@@ -593,7 +607,7 @@ def plan_source_ces(
     az_padding : float, optional
         Extra azimuth padding on each side of the solved
         ``[az_start, az_start + az_throw]`` interval, in degrees.
-        Default 0.5. Must be non-negative.
+        Default 0.5. Must lie in ``[0, 360]``.
     az_branch : float, optional
         Centre of the azimuth wrap branch. If given, ``az_start`` is
         re-expressed in ``[az_branch - 180, az_branch + 180)``.
@@ -605,6 +619,10 @@ def plan_source_ces(
         raises :class:`~fyst_trajectories.exceptions.TargetNotObservableError`.
         Pass ``True`` to clip ``(t0, t1)`` to the overlap and emit a
         :class:`~fyst_trajectories.exceptions.PointingWarning` instead.
+        With ``start_time`` and no ``el_bore``, ``el_bore`` is derived the
+        same either way and puts the cover's near side after the anchor,
+        so the clip can fall only where the source turns before it
+        crosses the whole cover.
     v_az : float, optional
         Override the solved azimuth drift rate (deg/s) instead of
         running the Nelder-Mead optimisation.
@@ -663,11 +681,13 @@ def plan_source_ces(
     Raises
     ------
     ValueError
-        On incompatible argument combinations, a non-positive step, speed,
-        acceleration, throw or dwell, a negative ``az_padding``, a reversed
-        window, a ``dwell`` shorter than ``sampling_step_seconds``, or a
-        footprint whose cover is a single point with ``az_padding=0`` and
-        no ``az_throw`` (a sweep with no width at any time).
+        On incompatible argument combinations, a step, speed, acceleration,
+        throw or dwell that is not a positive real number (a ``bool``, an
+        array of one or more dimensions and text are not real numbers here),
+        an ``az_padding`` that is not a real number in ``[0, 360]``, a
+        reversed window, a ``dwell`` shorter than ``sampling_step_seconds``,
+        or a footprint whose cover is a single point with ``az_padding=0``
+        and no ``az_throw`` (a sweep with no width at any time).
     DwellExceedsCrossingError
         When ``dwell`` is longer than the solved footprint crossing. A
         :class:`~fyst_trajectories.exceptions.PointingError` subclass that
@@ -681,8 +701,9 @@ def plan_source_ces(
     PointingError
         When the source reaches no vertex of the footprint's cover: with
         ``allow_partial=True``, or when ``el_bore`` is derived from a
-        ``start_time`` anchor too near culmination for the source to climb
-        onto the footprint. When it crosses the cover at a single azimuth
+        ``start_time`` anchor whose explicit ``mode`` runs against the
+        source's motion there and the source turns before it climbs onto
+        the footprint. When it crosses the cover at a single azimuth
         (one vertex of a partial cover in reach, coincident vertices, or
         vertices an explicit ``v_az`` lines up) with ``az_padding=0`` and no
         ``az_throw``, so the swept window has no width. When the Nelder-Mead
@@ -812,6 +833,7 @@ def plan_source_ces(
     boresight_rot_deg = computed["boresight_rot"]
     actual_duration = core.actual_duration
     velocity = core.velocity
+    az_accel = core.az_accel
     n_scans = core.n_scans
     az_stop = core.az_stop
     t0 = core.t0
@@ -966,8 +988,8 @@ def plan_source_ces_passes(
     Because these two knobs are decoupled, the sequence both densifies
     coverage across the footprint (fine eta offsets) and stays
     non-overlapping in time (an ``el_step`` of order the footprint
-    extent). Reducing ``el_step`` below the footprint extent will overlap
-    the passes in time, and a
+    extent). Reducing ``el_step`` sufficiently below the footprint extent
+    can overlap the passes in time, and a
     :class:`~fyst_trajectories.exceptions.PointingWarning` is emitted when
     the returned pass windows overlap.
 
@@ -1024,8 +1046,10 @@ def plan_source_ces_passes(
         Approximate anchor for the first pass in time. Mutually exclusive
         with ``night`` and ``window``. When given, ``el_bore`` and
         ``mode`` are derived if omitted (see :func:`plan_source_ces`); the
-        first chronological pass then starts near the anchor and the rest
-        follow at the usual ``el_step`` spacing.
+        first chronological pass then starts near the anchor, or later for
+        a cover that lies beyond the boresight along the source's motion
+        (see :func:`plan_source_ces`), and the rest follow at the usual
+        ``el_step`` spacing.
     mode : {"rising", "setting"}, optional
         Direction of the source arc, forwarded to each pass. With
         ``start_time`` and no ``mode``, taken from the elevation slope
@@ -1041,7 +1065,7 @@ def plan_source_ces_passes(
     az_accel : float, optional
         Azimuth acceleration in deg/s^2. Default 1.0.
     az_padding : float, optional
-        Extra azimuth padding per side in degrees. Default 0.5. Must be non-negative.
+        Extra azimuth padding per side in degrees. Default 0.5. Must lie in ``[0, 360]``.
     az_branch : float, optional
         Centre of the azimuth wrap branch.
     allow_partial : bool, optional
@@ -1075,9 +1099,10 @@ def plan_source_ces_passes(
     ------
     ValueError
         If neither or both of ``n_passes`` and ``eta_offsets`` are given,
-        if ``n_passes < 1``, if ``step``/``el_step`` are non-positive, if
-        ``step`` is passed without ``n_passes``, if ``dwell`` is given for
-        more than one pass, or as :func:`plan_source_ces` raises it.
+        if ``n_passes < 1``, if a given ``step`` or ``el_step`` is not a
+        positive real number, if ``step`` is passed without ``n_passes``, if
+        ``dwell`` is given for more than one pass, or as
+        :func:`plan_source_ces` raises it.
     TargetNotObservableError
         If a pass steps the footprint to a row the source never reaches
         within the search window (propagated from :func:`plan_source_ces`),
@@ -1140,8 +1165,7 @@ def plan_source_ces_passes(
     if el_step is None:
         el_step_val = eta_extent
     else:
-        el_step_val = float(el_step)
-        _require_positive(el_step_val, "el_step")
+        el_step_val = _require_positive(el_step, "el_step")
 
     if start_time is not None:
         # Resolve the anchor into (central el_bore, window, mode). The anchor
@@ -1152,7 +1176,7 @@ def plan_source_ces_passes(
         source = _SourceSpec(
             body=body, ra=ra, dec=dec, pm_ra=pm_ra, pm_dec=pm_dec, ref_epoch=ref_epoch
         )
-        anchor, coords, resolved_mode, el_at_anchor = _resolve_anchor_prefix(
+        anchor, coords, resolved_mode, el_at_anchor, slope = _resolve_anchor_prefix(
             start_time=start_time,
             el_bore=el_bore,
             mode=mode,
@@ -1173,6 +1197,7 @@ def plan_source_ces_passes(
             first_el_bore = _derive_anchored_el_bore(
                 anchor=anchor,
                 el_at_anchor=el_at_anchor,
+                slope=slope,
                 mode=resolved_mode,
                 coords=coords,
                 fp=first_fp,

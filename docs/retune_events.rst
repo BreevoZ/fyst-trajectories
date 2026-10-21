@@ -48,8 +48,9 @@ Two more uniform-cadence knobs, both off by default:
   module: each module's first retune is offset by
   ``module_index * retune_interval / n_modules``, so with
   ``n_modules=7`` only one module is retuning at a time, as long as
-  ``retune_duration`` is shorter than ``retune_interval / n_modules``
-  (it is, at the defaults). The per-module duty cost is unchanged;
+  ``retune_duration`` is at most ``retune_interval / n_modules``
+  (it is, at the defaults); a longer one overlaps the modules' retunes
+  and warns. The per-module duty cost is unchanged;
   :func:`~fyst_trajectories.retune.inject_retune` states what
   staggering buys, the instrument-team premise it rests on, and how to
   compose it in event-list mode.

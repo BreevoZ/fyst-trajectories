@@ -17,15 +17,74 @@ the instrument team's ``IM0`` .. ``IM6`` in the first minor release after
 the correspondence to the as-built focal plane is confirmed; the two
 schemes do not correspond index-for-index (see :doc:`instrument_offsets`).
 
+v0.11.0 (2026-10-21)
+--------------------
+
+Breaking changes
+~~~~~~~~~~~~~~~~
+
+- **A scan block's computed parameters are read-only.**
+  ``ScanBlock.computed_params`` is a read-only mapping, as
+  ``TrajectoryMetadata.pattern_params`` and ``ObservingPatch.scan_params``
+  have been since v0.10.0; adding a key in place raises ``TypeError``.
+
+  **Migration:** ``params = dict(block.computed_params)`` and add to the copy.
+
+- **ECSV times carry an explicit UTC offset.** ``write_timeline`` writes
+  ``2026-11-01T09:00:00.123+00:00`` where it wrote ``2026-11-01 09:00:00.123``,
+  and astropy's ``Time`` does not parse a string with an offset: code that
+  read the ``start_time`` and ``stop_time`` columns, or the window keys in
+  the header, with it raises ``ValueError``.
+
+  **Migration:** ``read_timeline`` reads both forms; for a column on its own,
+  ``datetime.fromisoformat(s)`` or ``Time(s.removesuffix("+00:00"), scale="utc")``.
+
+Additions
+~~~~~~~~~
+
+- **One record per visit for the execution layer.** ``dispatch_records(timeline)``
+  returns a planned calibration night as a JSON-ready record: for each visit
+  its slews, its detector operations in execution order and each pass's
+  ``scan_params`` with its ``scheduled_t0_unix``, duration and slack.
+  ``NightRecord`` and its parts declare the shape, whose keys are stable and
+  may gain additions.
+
 Fixes that change results
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- **ECSV times carry an explicit UTC offset.** ``write_timeline`` writes
-  ``2026-11-01T09:00:00.123+00:00`` instead of ``2026-11-01 09:00:00.123``,
-  keeping the millisecond digits. TOAST's ``GroundSchedule`` parses these
-  strings with ``datetime.fromisoformat``, and without an offset its scan
-  times depended on the host timezone (+5 h on a host in New York, for
-  instance). ``read_timeline`` reads both forms, ``Z`` and other offsets.
+- **Calibration-night passes wait for their dispatch lead, and the sheet
+  hands the execution layer the search start.** Every pass now starts at
+  least ``CalibrationNightPolicy.dispatch_lead_seconds`` (20 s) after the
+  detector operations before it, and a pass row's ``scheduled_t0_unix`` is
+  the planner's search start, not the pass start: the execution layer
+  searches from the later of that instant and 10 s after the dispatch, so
+  handed the pass start it refused every rising pass. Passes start later,
+  by about 26 s for each visit that directly follows another, so a pass near
+  the end of its elevation band or of the night can be lost. A night
+  recorded before the lead existed resumes with it at zero.
+
+- **A pong or daisy visit stays clear of the zenith.** The offline scheduler
+  admits, slews to and times a pong or daisy visit only while the circle
+  that bounds its pattern excludes the zenith, where it used to slew and
+  then idle as unplannable; a field whose pattern passes over the zenith
+  near transit now idles in place through that interval and loses those
+  subscans.
+
+- **Anchored source-CES passes on the inner-ring modules.** Given
+  ``start_time`` and no ``el_bore``, ``plan_source_ces``,
+  ``plan_source_ces_passes`` and ``compute_source_ces_params`` refused a
+  ring module whose cover lies beyond the boresight along the source's
+  motion, and often ``i2``. They now plan the pass, which starts when the
+  source reaches the module, and within 2.53° of the culmination derive a
+  ring module's ``el_bore`` from its projected cover. Every anchored call
+  that planned before plans the same pass, and a calibration-night visit
+  deferred as ``unplannable`` on such a module is now planned.
+
+- **A schedule handed to TOAST keeps its UTC times on any host.** TOAST's
+  ``GroundSchedule`` parses the ECSV times with ``datetime.fromisoformat``
+  and takes their ``timestamp()``, so the offset-free strings v0.10.0 wrote
+  became host-local times; the ``+00:00`` offset above makes them UTC
+  everywhere. Fixed by Yihong Zhou.
 
 v0.10.0 (2026-10-06)
 --------------------

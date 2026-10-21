@@ -148,7 +148,10 @@ the planner's search from each block's ``search_start`` and so returns
 each pass as it was planned, sample for sample (a block without
 ``search_start`` is re-solved around its recorded ``window`` instead; see
 :func:`~fyst_trajectories.overhead.schedule_to_trajectories`); the default
-``science_only=True`` returns science blocks only. An explicit
-``planet_cal_el_step`` smaller than the footprint's elevation extent makes
-adjacent pass windows overlap in time, and the planner emits a
-:class:`~fyst_trajectories.exceptions.PointingWarning` when they do.
+``science_only=True`` returns science blocks only. The planner's advisories
+about a pass, such as the on-sky azimuth speed advisory above about 60°
+elevation, are raised by this rebuild, as a science subscan's are, and not
+while the timeline is generated. An explicit ``planet_cal_el_step``
+sufficiently below the footprint's elevation extent can make adjacent pass
+windows overlap in time; a pass that starts before the previous emitted pass
+ends is not emitted, which leaves a gap in the recorded ``pass_index``.

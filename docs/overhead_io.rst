@@ -134,13 +134,14 @@ as a dedicated column lands in ``block_meta_json`` so the round-trip remains
 lossless.
 
 Header metadata carries the declared timeline window, the site (coordinates,
-Nasmyth port, plate scale, sun-avoidance radii), and every
+axis limits, Nasmyth port, plate scale, sun-avoidance settings), and every
 :class:`~fyst_trajectories.overhead.OverheadModel` and
 :class:`~fyst_trajectories.overhead.CalibrationPolicy` field. Any key missing
 from a file falls back to that dataclass's default on read, so a partial or
-hand-written header still loads. Telescope axis limits are not persisted: a
-non-FYST site reloads with the FYST limits and a
-:class:`~fyst_trajectories.exceptions.PointingWarning`.
+hand-written header still loads. A missing site key takes the FYST value
+instead, with a :class:`~fyst_trajectories.exceptions.PointingWarning`
+naming it when the site is not at the FYST coordinates; a file written
+before the header held the axis limits reloads with the FYST limits.
 
 A timeline with no blocks, which is what
 :func:`~fyst_trajectories.overhead.plan_calibration_night` returns when the
@@ -191,13 +192,14 @@ coordinates stored as ``Quantity`` header metadata. TOAST's
 ``GroundSchedule`` v5 reader can therefore read them directly, ignoring
 the FYST extension columns.
 
-All block times, timeline window metadata, and empty placeholder times are
-UTC ISO-8601 strings to the millisecond with an explicit ``+00:00`` offset,
-for example ``2026-08-02T01:25:00.123+00:00``. Without an offset, TOAST's
-``datetime.fromisoformat`` produces a naive datetime whose ``timestamp()``
-depends on the host timezone. ``read_timeline`` also accepts older
-offset-free UTC strings, ``Z``, and non-zero offsets, converting the latter
-to the corresponding UTC instant.
+All block times, the timeline window in the header and the placeholder row
+of an empty file are UTC ISO-8601 strings to the millisecond with an explicit
+``+00:00`` offset, for example ``2026-08-02T01:25:00.123+00:00``. Without the
+offset, TOAST's ``datetime.fromisoformat`` returns a naive datetime whose
+``timestamp()`` depends on the host's timezone, and a schedule read on a host
+set to New York time ran five hours late. ``read_timeline`` also accepts the
+offset-free UTC strings written before v0.11.0, ``Z`` and non-zero offsets,
+which it converts to the UTC instant.
 
 Standard TOAST schedule files (without ``block_type``, ``scan_type``,
 ``rising``, or the patch-geometry extension columns) are also supported on

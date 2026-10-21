@@ -9,6 +9,7 @@ immutable after creation.
 import math
 import numbers
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .._validation import _require_finite, _require_non_negative, _require_positive
@@ -69,15 +70,23 @@ def _warn_if_unusual(
         )
 
 
+def _store_checked(config: "ScanConfig", check: Callable[[float, str], float], *names: str) -> None:
+    """Check each named field with ``check`` and store the float it returns.
+
+    ``object.__setattr__`` is the frozen-field idiom: it writes past the
+    frozen dataclass's ``__setattr__``, so the config keeps the number it
+    checked, whatever real-number type it was given.
+    """
+    for name in names:
+        object.__setattr__(config, name, check(getattr(config, name), name))
+
+
 def _require_pong_fields(config: "PongScanConfig | PongAltAzScanConfig") -> None:
     """Refuse invalid on-sky Pong fields; shared by both Pong configs."""
-    _require_positive(config.width, "width")
-    _require_positive(config.height, "height")
-    _require_positive(config.spacing, "spacing")
-    _require_positive(config.velocity, "velocity")
+    _store_checked(config, _require_positive, "width", "height", "spacing", "velocity")
     if not isinstance(config.num_terms, numbers.Integral) or config.num_terms < 1:
         raise ValueError(f"num_terms must be at least 1, got {config.num_terms!r}")
-    _require_finite(config.angle, "angle")
+    _store_checked(config, _require_finite, "angle")
 
 
 def _warn_pong_fields(config: "PongScanConfig | PongAltAzScanConfig") -> None:
@@ -93,12 +102,10 @@ def _warn_pong_fields(config: "PongScanConfig | PongAltAzScanConfig") -> None:
 
 def _require_daisy_fields(config: "DaisyScanConfig | DaisyAltAzScanConfig") -> None:
     """Refuse invalid on-sky Daisy fields; shared by both Daisy configs."""
-    _require_positive(config.radius, "radius")
-    _require_positive(config.velocity, "velocity")
-    _require_positive(config.turn_radius, "turn_radius")
-    _require_non_negative(config.avoidance_radius, "avoidance_radius")
-    _require_positive(config.start_acceleration, "start_acceleration")
-    _require_finite(config.y_offset, "y_offset")
+    _store_checked(config, _require_positive, "radius", "velocity", "turn_radius")
+    _store_checked(config, _require_non_negative, "avoidance_radius")
+    _store_checked(config, _require_positive, "start_acceleration")
+    _store_checked(config, _require_finite, "y_offset")
 
 
 def _warn_daisy_fields(config: "DaisyScanConfig | DaisyAltAzScanConfig") -> None:
@@ -120,6 +127,7 @@ def _warn_daisy_fields(config: "DaisyScanConfig | DaisyAltAzScanConfig") -> None
 
 def _require_el_center(config: "PongAltAzScanConfig | DaisyAltAzScanConfig") -> None:
     """Refuse an ``el_center`` whose cosine is not a usable azimuth stretch."""
+    _store_checked(config, _require_finite, "el_center")
     if not 0.0 < config.el_center < 90.0:
         raise ValueError(
             f"el_center must be in (0, 90) degrees so cos(el_center) is nonzero, "
@@ -143,6 +151,11 @@ def _warn_az_coord_velocity(config: "PongAltAzScanConfig | DaisyAltAzScanConfig"
 class ScanConfig:
     """Base configuration for all scan patterns.
 
+    Every float field of a config takes any real number (an ``int``, a
+    ``Decimal``, a NumPy scalar or a 0-d array, for example) and stores it
+    as a ``float``. A ``bool``, an array of one or more dimensions, text and
+    ``None`` are refused with a ``ValueError`` naming the field.
+
     Parameters
     ----------
     timestep : float
@@ -151,13 +164,14 @@ class ScanConfig:
     Raises
     ------
     ValueError
-        If timestep is not positive.
+        If timestep is a ``bool``, an array of one or more dimensions, text
+        or ``None``, or is not positive.
     """
 
     timestep: float
 
     def __post_init__(self) -> None:
-        _require_positive(self.timestep, "timestep")
+        _store_checked(self, _require_positive, "timestep")
 
 
 @dataclass(frozen=True)
@@ -186,8 +200,9 @@ class ConstantElScanConfig(ScanConfig):
     Raises
     ------
     ValueError
-        If az_speed or az_accel is not positive, or if az_start, az_stop or
-        elevation is not finite.
+        If a field is a ``bool``, an array of one or more dimensions, text or
+        ``None``, if az_speed or az_accel is not positive, or if az_start,
+        az_stop or elevation is not finite.
 
     Warns
     -----
@@ -231,10 +246,8 @@ class ConstantElScanConfig(ScanConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        for name in ("az_start", "az_stop", "elevation"):
-            _require_finite(getattr(self, name), name)
-        _require_positive(self.az_speed, "az_speed")
-        _require_positive(self.az_accel, "az_accel")
+        _store_checked(self, _require_finite, "az_start", "az_stop", "elevation")
+        _store_checked(self, _require_positive, "az_speed", "az_accel")
         az_throw = abs(self.az_stop - self.az_start)
         _warn_if_unusual(self.az_speed, MAX_REASONABLE_VELOCITY_DEG_S, "Azimuth speed", "deg/s")
         _warn_if_unusual(
@@ -295,6 +308,8 @@ class PongScanConfig(ScanConfig):
     Raises
     ------
     ValueError
+        If a float field is a ``bool``, an array of one or more dimensions,
+        text or ``None``.
         If width, height, spacing, or velocity is not positive.
         If num_terms is not an integer or is less than 1.
         If angle is not finite.
@@ -391,9 +406,11 @@ class PongAltAzScanConfig(ScanConfig):
     Raises
     ------
     ValueError
-        If width, height, spacing, or velocity is not positive, if
-        num_terms is not an integer or is less than 1, if az_center or
-        angle is not finite, or if el_center is not in ``(0, 90)``.
+        If a float field is a ``bool``, an array of one or more dimensions,
+        text or ``None``, if width, height, spacing, or velocity is not
+        positive, if num_terms is not an integer or is less than 1, if
+        az_center or angle is not finite, or if el_center is not in
+        ``(0, 90)``.
 
     Warns
     -----
@@ -424,7 +441,7 @@ class PongAltAzScanConfig(ScanConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
         _require_pong_fields(self)
-        _require_finite(self.az_center, "az_center")
+        _store_checked(self, _require_finite, "az_center")
         _require_el_center(self)
         _warn_pong_fields(self)
         _warn_az_coord_velocity(self)
@@ -463,6 +480,8 @@ class DaisyScanConfig(ScanConfig):
     Raises
     ------
     ValueError
+        If a field is a ``bool``, an array of one or more dimensions, text or
+        ``None``.
         If radius, velocity, or turn_radius is not positive.
         If avoidance_radius is negative.
         If start_acceleration is not positive.
@@ -563,7 +582,8 @@ class DaisyAltAzScanConfig(ScanConfig):
     Raises
     ------
     ValueError
-        If radius, velocity, or turn_radius is not positive, if
+        If a field is a ``bool``, an array of one or more dimensions, text or
+        ``None``, if radius, velocity, or turn_radius is not positive, if
         avoidance_radius is negative, if start_acceleration is not positive,
         if az_center or y_offset is not finite, or if el_center is not in
         ``(0, 90)``.
@@ -600,7 +620,7 @@ class DaisyAltAzScanConfig(ScanConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
         _require_daisy_fields(self)
-        _require_finite(self.az_center, "az_center")
+        _store_checked(self, _require_finite, "az_center")
         _require_el_center(self)
         _warn_daisy_fields(self)
         _warn_az_coord_velocity(self)
@@ -723,8 +743,9 @@ class LinearMotionConfig(ScanConfig):
     Raises
     ------
     ValueError
-        If ``timestep`` is not positive, or if any of the four motion
-        fields is not finite.
+        If a field is a ``bool``, an array of one or more dimensions, text or
+        ``None``, if ``timestep`` is not positive, or if any of the four
+        motion fields is not finite.
     """
 
     az_start: float
@@ -739,10 +760,4 @@ class LinearMotionConfig(ScanConfig):
         # finiteness is the whole contract. Without it a NaN reaches the
         # generator and produces an all-NaN trajectory that only the
         # position-bounds check refuses, with no mention of which field.
-        for name, value in (
-            ("az_start", self.az_start),
-            ("el_start", self.el_start),
-            ("az_velocity", self.az_velocity),
-            ("el_velocity", self.el_velocity),
-        ):
-            _require_finite(value, name)
+        _store_checked(self, _require_finite, "az_start", "el_start", "az_velocity", "el_velocity")

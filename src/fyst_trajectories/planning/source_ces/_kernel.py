@@ -23,7 +23,7 @@ from astropy.time import Time, TimeDelta
 from scipy import interpolate
 from scipy.optimize import minimize
 
-from ..._validation import _require_non_negative, _require_positive
+from ..._validation import AZ_PADDING_MAX_DEG, _require_non_negative, _require_positive
 from ...coordinates import Coordinates
 from ...exceptions import (
     DwellExceedsCrossingError,
@@ -99,6 +99,8 @@ class _SourceCESCore:
     # or the one a ``start_time`` anchor derived.
     el_bore: float
     velocity: float
+    # The checked acceleration, as the float the kernel computed with.
+    az_accel: float
     az_stop: float
     source_label: str
     fp: ArrayFootprint
@@ -350,28 +352,40 @@ def _validate_kernel_inputs(
     az_speed: float | None,
     az_throw: float | None,
     dwell: float | None,
-) -> None:
+) -> tuple[float, float, float, float | None, float | None, float | None]:
     """Refuse a malformed kernel request before any computation, in a fixed order.
+
+    Returns
+    -------
+    tuple
+        ``(sampling_step_seconds, az_accel, az_padding, az_speed, az_throw,
+        dwell)`` as floats (an omitted optional value stays ``None``): the
+        values the kernel computes with.
 
     Raises
     ------
     ValueError
-        On a non-positive step, acceleration, speed, throw or dwell, a negative
-        ``az_padding``, an ``az_throw`` combined with an explicit ``az_padding``,
-        an ``ArrayFootprint`` whose cover is a single point with ``az_padding``
-        0 and no ``az_throw``, a ``dwell`` shorter than ``sampling_step_seconds``,
-        a missing or conflicting source or window, a missing or unknown
-        ``mode``, an array-valued time or a reversed window.
+        On a step, acceleration, speed, throw or dwell that is not a
+        positive real number (a ``bool``, an array of one or more dimensions
+        and text are not real numbers here), an ``az_padding`` that is not a
+        real number in ``[0, 360]``, an ``az_throw`` combined with an explicit
+        ``az_padding``, an ``ArrayFootprint`` whose cover is a single point
+        with ``az_padding`` 0 and no ``az_throw``, a ``dwell`` shorter than
+        ``sampling_step_seconds``, a missing or conflicting source or window,
+        a missing or unknown ``mode``, an array-valued time or a reversed
+        window.
     ElevationBoundsError
         When ``el_bore`` lies outside ``site.telescope_limits.elevation``.
     """
-    _require_positive(sampling_step_seconds, "sampling_step_seconds")
-    _require_positive(az_accel, "az_accel")
-    _require_non_negative(az_padding, "az_padding")
+    sampling_step_seconds = _require_positive(sampling_step_seconds, "sampling_step_seconds")
+    az_accel = _require_positive(az_accel, "az_accel")
+    # A padding wider than a full turn is meaningless; one below it but past
+    # the azimuth range reaches the bounds checks as an AzimuthBoundsError.
+    az_padding = _require_non_negative(az_padding, "az_padding", maximum=AZ_PADDING_MAX_DEG)
     if az_speed is not None:
-        _require_positive(az_speed, "az_speed")
+        az_speed = _require_positive(az_speed, "az_speed")
     if az_throw is not None:
-        _require_positive(az_throw, "az_throw")
+        az_throw = _require_positive(az_throw, "az_throw")
         if az_padding != _DEFAULT_AZ_PADDING_DEG:
             raise ValueError(
                 "az_throw replaces the padded throw, so it cannot be combined with an "
@@ -391,7 +405,7 @@ def _validate_kernel_inputs(
             "in place of az_padding"
         )
     if dwell is not None:
-        _require_positive(dwell, "dwell")
+        dwell = _require_positive(dwell, "dwell")
         if dwell < sampling_step_seconds:
             # The window the dwell narrows is resampled on the
             # ``sampling_step_seconds`` grid, so a shorter dwell cannot be
@@ -453,6 +467,7 @@ def _validate_kernel_inputs(
             limit_min=el_limits.min,
             limit_max=el_limits.max,
         )
+    return sampling_step_seconds, az_accel, az_padding, az_speed, az_throw, dwell
 
 
 def _solve_source_arc(
@@ -1056,6 +1071,7 @@ def _assemble(
         mode=mode,
         el_bore=el_bore,
         velocity=float(nominal_velocity),
+        az_accel=az_accel,
         az_stop=float(az_stop),
         source_label=source_label,
         fp=fp,
@@ -1111,20 +1127,22 @@ def _compute_source_ces_core(
     else: both only warn. The ``start_time`` anchor's probe sets it, since
     it reads only the pass start.
     """
-    _validate_kernel_inputs(
-        source=source,
-        footprint=footprint,
-        el_bore=el_bore,
-        window=window,
-        night=night,
-        mode=mode,
-        site=site,
-        sampling_step_seconds=sampling_step_seconds,
-        az_accel=az_accel,
-        az_padding=az_padding,
-        az_speed=az_speed,
-        az_throw=az_throw,
-        dwell=dwell,
+    sampling_step_seconds, az_accel, az_padding, az_speed, az_throw, dwell = (
+        _validate_kernel_inputs(
+            source=source,
+            footprint=footprint,
+            el_bore=el_bore,
+            window=window,
+            night=night,
+            mode=mode,
+            site=site,
+            sampling_step_seconds=sampling_step_seconds,
+            az_accel=az_accel,
+            az_padding=az_padding,
+            az_speed=az_speed,
+            az_throw=az_throw,
+            dwell=dwell,
+        )
     )
 
     boresight_rot_deg = 0.0 if boresight_rot is None else float(boresight_rot)

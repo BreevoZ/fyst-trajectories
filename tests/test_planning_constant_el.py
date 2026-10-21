@@ -1,6 +1,7 @@
 """Tests for plan_constant_el_scan."""
 
 import warnings
+from decimal import Decimal
 
 import numpy as np
 import pytest
@@ -9,7 +10,7 @@ from astropy.time import Time
 
 from fyst_trajectories import get_fyst_site
 from fyst_trajectories.coordinates import Coordinates
-from fyst_trajectories.exceptions import PointingError, PointingWarning
+from fyst_trajectories.exceptions import AzimuthBoundsError, PointingError, PointingWarning
 from fyst_trajectories.patterns.configs import ConstantElScanConfig
 from fyst_trajectories.planning import FieldRegion, ScanBlock, plan_constant_el_scan
 from fyst_trajectories.planning._ce_geometry import (
@@ -156,6 +157,98 @@ class TestPlanConstantElScan:
                 az_padding=-1.0,
             )
 
+    @pytest.mark.parametrize(
+        "bad",
+        [float("nan"), "2.0", None, 9e307, 10**400, 361.0],
+        ids=["nan", "text", "none", "9e307", "int-1e400", "past-a-turn"],
+    )
+    def test_malformed_az_padding_raises(self, site, ecdfs_field, search_time, bad):
+        """A padding that is not a real number in [0, 360] is a ValueError that names it."""
+        with pytest.raises(ValueError, match="az_padding") as excinfo:
+            plan_constant_el_scan(
+                field=ecdfs_field,
+                elevation=50.0,
+                velocity=0.5,
+                site=site,
+                start_time=search_time,
+                rising=True,
+                angle=170.0,
+                az_padding=bad,
+            )
+        assert not isinstance(excinfo.value, PointingError)
+
+    @pytest.mark.parametrize(
+        ("name", "value", "lsa_window"),
+        [
+            pytest.param("az_padding", Decimal("2.0"), None, id="az_padding"),
+            pytest.param("velocity", Decimal("0.5"), None, id="velocity"),
+            pytest.param("az_accel", Decimal("1.0"), None, id="az_accel"),
+            pytest.param("elevation", Decimal("50.0"), None, id="elevation"),
+            pytest.param("max_search_hours", Decimal("12.0"), None, id="max_search_hours"),
+            pytest.param("step_seconds", Decimal("30.0"), None, id="step_seconds"),
+            pytest.param(
+                "field",
+                FieldRegion(
+                    ra_center=53.117,
+                    dec_center=-27.808,
+                    width=Decimal("5.0"),
+                    height=Decimal("6.7"),
+                ),
+                None,
+                id="field",
+            ),
+            # A window inside the E-CDF-S crossing pass, which spans LST 5.8 to 12.6 deg.
+            pytest.param(
+                "max_search_hours", Decimal("12.0"), (7.0, 12.0), id="lsa-max_search_hours"
+            ),
+            pytest.param("step_seconds", Decimal("30.0"), (7.0, 12.0), id="lsa-step_seconds"),
+        ],
+    )
+    def test_a_decimal_argument_plans_as_its_float(
+        self, site, ecdfs_field, search_time, ecdfs_block, name, value, lsa_window
+    ):
+        """A ``Decimal`` argument, or a field sized in ``Decimal``, plans as the float does.
+
+        The search, by elevation crossing or by sidereal window, the leg
+        quantiser and the Sun sweep compute with the float each check
+        returns, so a ``Decimal`` never meets float arithmetic. The shared
+        block is the crossing pass planned from floats.
+        """
+        kwargs = dict(
+            field=ecdfs_field,
+            elevation=50.0,
+            velocity=0.5,
+            site=site,
+            start_time=search_time,
+            angle=170.0,
+        )
+        if lsa_window is None:
+            kwargs["rising"] = True
+            expected = ecdfs_block
+        else:
+            kwargs["lsa_window"] = lsa_window
+            expected = plan_constant_el_scan(**kwargs)
+        block = plan_constant_el_scan(**{**kwargs, name: value})
+        assert block.computed_params == expected.computed_params
+        assert block.config == expected.config
+        np.testing.assert_array_equal(block.trajectory.az, expected.trajectory.az)
+
+    def test_a_full_turn_of_padding_reaches_the_azimuth_limits(
+        self, site, ecdfs_field, search_time
+    ):
+        """360 deg is the widest padding accepted, and its range exceeds the azimuth limits."""
+        with pytest.raises(AzimuthBoundsError):
+            plan_constant_el_scan(
+                field=ecdfs_field,
+                elevation=50.0,
+                velocity=0.5,
+                site=site,
+                start_time=search_time,
+                rising=True,
+                angle=170.0,
+                az_padding=360.0,
+            )
+
     def test_science_mask_excludes_turnarounds(self, ecdfs_block):
         traj = ecdfs_block.trajectory
         assert traj.scan_flag is not None
@@ -266,11 +359,12 @@ class TestCEGeometryWrapHandling:
         assert duration > 0
         assert duration < 30 * 60  # 30 min; the true value is ~13 min for a 3 deg width
 
-    def test_compute_ce_duration_rejects_non_positive_step(self, site):
+    @pytest.mark.parametrize("argument", ["max_search_hours", "step_seconds"])
+    def test_compute_ce_duration_rejects_a_non_positive_horizon_or_step(self, site, argument):
         coords = Coordinates(site)
         field = FieldRegion(ra_center=1.0, dec_center=-25.0, width=3.0, height=3.0)
         base_time = Time("2026-09-15T00:00:00", scale="utc")
-        with pytest.raises(ValueError, match="step_seconds must be positive"):
+        with pytest.raises(ValueError, match=f"{argument} must be positive"):
             _compute_ce_duration(
                 field,
                 angle=0.0,
@@ -278,7 +372,7 @@ class TestCEGeometryWrapHandling:
                 coords_obj=coords,
                 base_search_time=base_time,
                 rising=True,
-                step_seconds=0,
+                **{argument: 0},
             )
 
     def test_north_transit_planning_succeeds(self, site):
@@ -1033,13 +1127,10 @@ class TestConstantElSweptSunCheck:
 
         narrow = get_fyst_site(sun_exclusion_radius=75.0, sun_warning_radius=80.0)
         with pytest.warns(PointingWarning, match="EXCLUSION ZONE"):
-            self._plan(narrow)
+            block = self._plan(narrow)
 
         # The opening itself is clear, so the field-centre pre-flight alone
         # would have been silent: this is the sweep talking, not the anchor.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", PointingWarning)
-            block = self._plan(narrow)
         coords = Coordinates(narrow)
         cp = block.computed_params
         t_start = Time(cp["start_time_iso"], scale="utc")

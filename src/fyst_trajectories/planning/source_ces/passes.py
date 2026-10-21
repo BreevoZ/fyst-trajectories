@@ -92,6 +92,5 @@ def _resolve_pass_offsets(
     if step is None:
         step_val = footprint_eta_extent / n_passes
     else:
-        step_val = float(step)
-        _require_positive(step_val, "step")
+        step_val = _require_positive(step, "step")
     return [step_val * (k - (n_passes - 1) / 2.0) for k in range(n_passes)]

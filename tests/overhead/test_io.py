@@ -8,6 +8,7 @@ from astropy.table import QTable, Table
 from astropy.time import Time, TimeDelta
 
 from fyst_trajectories import Coordinates, get_fyst_site
+from fyst_trajectories.exceptions import PointingWarning
 from fyst_trajectories.overhead import (
     ObservingPatch,
     generate_timeline,
@@ -23,6 +24,25 @@ from fyst_trajectories.overhead.models import (
     ObservingTimeline,
     OverheadModel,
     TimelineBlock,
+)
+from fyst_trajectories.site import AxisLimits, Site, SunAvoidanceConfig, TelescopeLimits
+
+# The header keys of a site's axis limits, as ``write_timeline`` names them.
+_LIMIT_KEYS = (
+    "site_az_min",
+    "site_az_max",
+    "site_az_max_velocity",
+    "site_az_max_acceleration",
+    "site_el_min",
+    "site_el_max",
+    "site_el_max_velocity",
+    "site_el_max_acceleration",
+)
+
+# Axis limits that differ from FYST's in every field.
+_OTHER_LIMITS = TelescopeLimits(
+    azimuth=AxisLimits(min=-90.0, max=270.0, max_velocity=2.0, max_acceleration=1.0),
+    elevation=AxisLimits(min=25.0, max=70.0, max_velocity=0.8, max_acceleration=0.5),
 )
 
 
@@ -85,6 +105,45 @@ def _make_test_timeline():
         overhead_model=OverheadModel(),
         calibration_policy=CalibrationPolicy(),
         metadata={"test_key": "test_value"},
+    )
+
+
+def _custom_site():
+    """Return a site away from FYST in its coordinates and in every persisted field."""
+    return Site(
+        name="custom",
+        description="Test site",
+        latitude=-30.0,
+        longitude=-70.0,
+        elevation=2500.0,
+        telescope_limits=_OTHER_LIMITS,
+        sun_avoidance=SunAvoidanceConfig(enabled=True, exclusion_radius=40.0, warning_radius=48.0),
+        nasmyth_port="left",
+        plate_scale=10.0,
+    )
+
+
+def _idle_timeline(site):
+    """Return a one-minute timeline on ``site`` holding a single idle block."""
+    t0 = Time("2026-06-15T02:00:00", scale="utc")
+    return ObservingTimeline(
+        blocks=[
+            TimelineBlock(
+                t_start=t0,
+                t_stop=t0 + TimeDelta(60, format="sec"),
+                block_type="idle",
+                patch_name="noop",
+                az_start=180.0,
+                az_end=180.0,
+                elevation=50.0,
+                scan_index=0,
+            )
+        ],
+        site=site,
+        start_time=t0,
+        end_time=t0 + TimeDelta(60, format="sec"),
+        overhead_model=OverheadModel(),
+        calibration_policy=CalibrationPolicy(),
     )
 
 
@@ -557,7 +616,7 @@ class TestMetadataPersistence:
 
 
 class TestSiteReconstruction:
-    """Nasmyth port, plate scale, sun radii and description persist; limits do not."""
+    """Axis limits, Nasmyth port, plate scale, Sun settings and description persist."""
 
     def test_fyst_default_site(self, tmp_path):
         """A timeline written with the FYST default site must round-trip."""
@@ -578,116 +637,81 @@ class TestSiteReconstruction:
             dataclasses.replace(get_fyst_site(), nasmyth_port="left"),
             get_fyst_site(sun_avoidance_enabled=False),
             get_fyst_site(sun_exclusion_radius=50.0, sun_warning_radius=55.0),
+            dataclasses.replace(get_fyst_site(), telescope_limits=_OTHER_LIMITS),
         ],
-        ids=["left_port", "sun_avoidance_off", "sun_radii_50_55"],
+        ids=["left_port", "sun_avoidance_off", "sun_radii_50_55", "other_limits"],
     )
     def test_fyst_coordinates_keep_the_persisted_fields(self, tmp_path, written_site):
         """A FYST-coordinate site reads back with the fields it was written with.
 
-        The reader takes the limits from the FYST default for these
-        coordinates, so the Nasmyth port and the Sun settings are the
-        fields a default-only round trip cannot see being dropped.
+        The reader starts from the FYST default for these coordinates, so a
+        default-only round trip cannot see a field being dropped; each case
+        moves one of them off it. The reader maps each limit key back to an
+        axis the way the writer named it, so the header is read as well: a
+        round trip alone passes with the two axes' limits exchanged.
         """
-        t0 = Time("2026-06-15T02:00:00", scale="utc")
-        timeline = ObservingTimeline(
-            blocks=[
-                TimelineBlock(
-                    t_start=t0,
-                    t_stop=t0 + TimeDelta(60, format="sec"),
-                    block_type="idle",
-                    patch_name="noop",
-                    az_start=180.0,
-                    az_end=180.0,
-                    elevation=50.0,
-                    scan_index=0,
-                )
-            ],
-            site=written_site,
-            start_time=t0,
-            end_time=t0 + TimeDelta(60, format="sec"),
-            overhead_model=OverheadModel(),
-            calibration_policy=CalibrationPolicy(),
-        )
         path = tmp_path / "fyst_persisted.ecsv"
-        write_timeline(timeline, path)
+        write_timeline(_idle_timeline(written_site), path)
         loaded = read_timeline(path)
         assert loaded.site == written_site
+        meta = Table.read(str(path), format="ascii.ecsv").meta
+        az, el = written_site.telescope_limits.azimuth, written_site.telescope_limits.elevation
+        assert [meta[key] for key in _LIMIT_KEYS] == [
+            az.min,
+            az.max,
+            az.max_velocity,
+            az.max_acceleration,
+            el.min,
+            el.max,
+            el.max_velocity,
+            el.max_acceleration,
+        ]
 
     def test_custom_site_coordinates_preserved(self, tmp_path):
-        """A non-FYST site round-trips from metadata, not replaced.
+        """A non-FYST site round-trips from metadata, every field of it.
 
         Without this, a custom ``nasmyth_port="left"`` reads back as the FYST
-        default ``"right"``, silently flipping the field-rotation sign;
-        ``nasmyth_port``/``plate_scale``/sun radii must persist. ``telescope_limits``
-        are not persisted, so a ``PointingWarning`` is emitted on read.
+        default ``"right"``, silently flipping the field-rotation sign, and
+        the axis limits as FYST's. A header that holds every field reads
+        back without a warning (the suite makes a ``PointingWarning`` an
+        error).
         """
-        from fyst_trajectories.exceptions import PointingWarning
-        from fyst_trajectories.site import (
-            AxisLimits,
-            Site,
-            SunAvoidanceConfig,
-            TelescopeLimits,
-        )
-
-        custom_site = Site(
-            name="custom",
-            description="Test site",
-            latitude=-30.0,
-            longitude=-70.0,
-            elevation=2500.0,
-            telescope_limits=TelescopeLimits(
-                azimuth=AxisLimits(min=-180.0, max=360.0, max_velocity=3.0, max_acceleration=1.0),
-                elevation=AxisLimits(min=20.0, max=90.0, max_velocity=1.0, max_acceleration=0.5),
-            ),
-            sun_avoidance=SunAvoidanceConfig(
-                enabled=True, exclusion_radius=40.0, warning_radius=48.0
-            ),
-            nasmyth_port="left",
-            plate_scale=10.0,
-        )
-        t0 = Time("2026-06-15T02:00:00", scale="utc")
-        timeline = ObservingTimeline(
-            blocks=[
-                TimelineBlock(
-                    t_start=t0,
-                    t_stop=t0 + TimeDelta(60, format="sec"),
-                    block_type="idle",
-                    patch_name="noop",
-                    az_start=180.0,
-                    az_end=180.0,
-                    elevation=50.0,
-                    scan_index=0,
-                )
-            ],
-            site=custom_site,
-            start_time=t0,
-            end_time=t0 + TimeDelta(60, format="sec"),
-            overhead_model=OverheadModel(),
-            calibration_policy=CalibrationPolicy(),
-        )
+        custom_site = _custom_site()
         path = tmp_path / "custom_site.ecsv"
-        write_timeline(timeline, path)
-        with pytest.warns(PointingWarning, match="telescope_limits"):
-            loaded = read_timeline(path)
-        assert loaded.site.latitude == pytest.approx(-30.0)
-        assert loaded.site.longitude == pytest.approx(-70.0)
-        assert loaded.site.elevation == pytest.approx(2500.0)
-        # Without this, these fields reset to FYST defaults (silent lossy round-trip).
-        assert loaded.site.nasmyth_port == "left"
-        assert loaded.site.plate_scale == pytest.approx(10.0)
-        assert loaded.site.sun_avoidance.exclusion_radius == pytest.approx(40.0)
-        assert loaded.site.sun_avoidance.warning_radius == pytest.approx(48.0)
+        write_timeline(_idle_timeline(custom_site), path)
+        assert read_timeline(path).site == custom_site
+
+    @pytest.mark.parametrize("where", ["fyst", "elsewhere"])
+    def test_a_header_without_the_axis_limits_reads_the_fyst_ones(self, tmp_path, where):
+        """A header without the axis-limit keys reads back with the FYST limits.
+
+        At the FYST coordinates that is silent; for any other site the
+        warning names the keys the header lacks. Every other field still
+        reads back as written.
+        """
+        written_site = (
+            dataclasses.replace(get_fyst_site(), telescope_limits=_OTHER_LIMITS)
+            if where == "fyst"
+            else _custom_site()
+        )
+        path = tmp_path / "with_limits.ecsv"
+        write_timeline(_idle_timeline(written_site), path)
+        table = Table.read(str(path), format="ascii.ecsv")
+        for key in _LIMIT_KEYS:
+            del table.meta[key]
+        without = tmp_path / "without_limits.ecsv"
+        table.write(str(without), format="ascii.ecsv", overwrite=True)
+
+        if where == "fyst":
+            loaded = read_timeline(without)
+        else:
+            with pytest.warns(PointingWarning, match=", ".join(_LIMIT_KEYS)):
+                loaded = read_timeline(without)
+        fyst_limits = get_fyst_site().telescope_limits
+        assert loaded.site == dataclasses.replace(written_site, telescope_limits=fyst_limits)
 
     def test_site_description_round_trips_without_accumulation(self, tmp_path):
         """Description round-trips, telescope_name reflects the site, no metadata leak."""
-        from fyst_trajectories.exceptions import PointingWarning
-        from fyst_trajectories.site import (
-            AxisLimits,
-            Site,
-            SunAvoidanceConfig,
-            TelescopeLimits,
-        )
-
         custom_site = Site(
             name="myobs",
             description="My Test Observatory",
@@ -704,45 +728,23 @@ class TestSiteReconstruction:
             nasmyth_port="right",
             plate_scale=13.89,
         )
-        t0 = Time("2026-06-15T02:00:00", scale="utc")
-        timeline = ObservingTimeline(
-            blocks=[
-                TimelineBlock(
-                    t_start=t0,
-                    t_stop=t0 + TimeDelta(60, format="sec"),
-                    block_type="idle",
-                    patch_name="noop",
-                    az_start=180.0,
-                    az_end=180.0,
-                    elevation=50.0,
-                    scan_index=0,
-                )
-            ],
-            site=custom_site,
-            start_time=t0,
-            end_time=t0 + TimeDelta(60, format="sec"),
-            overhead_model=OverheadModel(),
-            calibration_policy=CalibrationPolicy(),
-        )
         path = tmp_path / "desc_site.ecsv"
-        write_timeline(timeline, path)
-        with pytest.warns(PointingWarning, match="Reconstructing a non-FYST Site"):
-            loaded = read_timeline(path)
+        write_timeline(_idle_timeline(custom_site), path)
+        loaded = read_timeline(path)
 
         # Description round-trips; without this it is silently dropped.
         assert loaded.site.description == "My Test Observatory"
         # telescope_name reflects the site, not a hardcoded "FYST".
         assert Table.read(str(path), format="ascii.ecsv").meta["telescope_name"] == "myobs"
-        # site_description is structural, not leaked into user metadata.
-        assert "site_description" not in loaded.metadata
+        # The site's header keys are structural, not leaked into user metadata.
+        assert not {"site_description", *_LIMIT_KEYS} & set(loaded.metadata)
 
-        # Second write/read cycle: no metadata accumulation; description stable.
+        # Second write/read cycle: no metadata accumulation; the site stable.
         path2 = tmp_path / "desc_site2.ecsv"
         write_timeline(loaded, path2)
-        with pytest.warns(PointingWarning, match="Reconstructing a non-FYST Site"):
-            loaded2 = read_timeline(path2)
-        assert loaded2.site.description == "My Test Observatory"
-        assert "site_description" not in loaded2.metadata
+        loaded2 = read_timeline(path2)
+        assert loaded2.site == custom_site
+        assert not {"site_description", *_LIMIT_KEYS} & set(loaded2.metadata)
 
 
 class TestBoresightAngle:

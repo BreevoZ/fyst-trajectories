@@ -359,6 +359,20 @@ def _planet_cal_pass_block(
     return block, t_stop, az_final, el_bore
 
 
+def _pass_end_unix(pass_block: ScanBlock) -> float:
+    """Return when a planned pass ends, as a Unix time.
+
+    That is the later of its ``t1_iso``, where its block ends, and the end
+    of its trajectory, which runs for the leg-quantised duration from
+    ``t0_iso``.
+    """
+    cp = pass_block.computed_params
+    return max(
+        Time(str(cp["t1_iso"]), scale="utc").unix,
+        Time(str(cp["t0_iso"]), scale="utc").unix + float(pass_block.duration),
+    )
+
+
 def _plan_planet_cal_acquisition(
     state: SchedulerState,
     ctx: SchedulerContext,
@@ -367,14 +381,22 @@ def _plan_planet_cal_acquisition(
     """Plan a planet calibration's passes and the slew to the first one.
 
     Returns ``(kept, transition, anchor)``: the whole passes that finish
-    before ``ctx.end_time``, the commandable slew to the first one, which
-    arrives no later than that pass starts, and the anchor the passes were
-    planned from. Returns ``None`` when the planner raises
+    before ``ctx.end_time``, less any pass that starts before the previous
+    kept one ends (at its ``t1_iso`` or its trajectory's end, whichever is
+    later); the commandable slew to the first one, which arrives no later
+    than that pass starts; and the anchor the passes were planned from.
+    Returns ``None`` when the planner raises
     :class:`~fyst_trajectories.exceptions.PointingError`, no pass fits, the
     slew is refused, or it still arrives late after the second plan.
     ``planner_kwargs`` are the arguments of
     :func:`~fyst_trajectories.planning.plan_source_ces_passes` except
     ``start_time``.
+
+    The planner's advisories are not raised, as a science subscan's build
+    raises none (:func:`_record_executed_azimuth`): one about a pass that
+    is emitted is raised again by a rebuild of the timeline, which plans
+    the pass again from its block, and the one naming passes that overlap
+    in time is acted on here, by that drop.
     """
     # Plan at the clock; when the slew arrives after the first pass would
     # start, plan once more anchored at the arrival. The planner starts a
@@ -383,7 +405,9 @@ def _plan_planet_cal_acquisition(
     anchor = state.current_time
     for _ in range(2):
         try:
-            passes = plan_source_ces_passes(start_time=anchor, **planner_kwargs)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", PointingWarning)
+                passes = plan_source_ces_passes(start_time=anchor, **planner_kwargs)
         except PointingError:
             return None
 
@@ -394,15 +418,21 @@ def _plan_planet_cal_acquisition(
         # set to, while the trajectory runs for the leg-quantised duration
         # from ``t0_iso``, and quantisation moves the two apart in either
         # direction by up to half a leg plus turnaround.
-        kept = [
-            b
-            for b in passes
-            if max(
-                Time(str(b.computed_params["t1_iso"]), scale="utc").unix,
-                Time(str(b.computed_params["t0_iso"]), scale="utc").unix + float(b.duration),
-            )
-            <= ctx.end_time.unix
-        ]
+        kept = [b for b in passes if _pass_end_unix(b) <= ctx.end_time.unix]
+        # Each pass block starts where the previous pass's block ends, at its
+        # ``t1_iso``, and the previous trajectory can run past that, so a
+        # pass that starts before the previous one ends by either measure
+        # (an el_step sufficiently below the footprint's elevation extent)
+        # would start before its own block or while the previous pass is
+        # still scanning. It is dropped; the gap it leaves in pass_index
+        # shows the drop, as n_passes shows a truncation.
+        sequence: list[ScanBlock] = []
+        for b in kept:
+            t0 = Time(str(b.computed_params["t0_iso"]), scale="utc")
+            if sequence and t0.unix < _pass_end_unix(sequence[-1]):
+                continue
+            sequence.append(b)
+        kept = sequence
         if not kept:
             return None
 
@@ -734,29 +764,47 @@ class PatchSelectionPhase(Phase):
     For each patch in ``ctx.patches``, computes its instantaneous
     (az, el) at ``state.current_time``, scores it against
     ``ctx.constraints``, and multiplies by ``patch.weight /
-    patch.priority``. The highest-scoring observable patch wins.
+    patch.priority``. A patch that pins ``elevation`` is scored at the
+    azimuth the field is at now and that elevation, the pose the rest of
+    the visit is judged at (:class:`SlewPhase` slews there and every
+    emitted block records it).
 
-    A patch that pins ``elevation`` is scored at the azimuth the field
-    is at now and the elevation the scan will command, which is the
-    pose the rest of the visit is judged at (:class:`SlewPhase` slews
-    there and every emitted block records it). The field's own track
-    still decides when its pattern leaves the elevation limits.
+    A patch with a positive score is still passed over when:
 
-    A pong or daisy patch is selectable only while its shortest subscan
-    (``min_scan_duration``, or one whole pattern period for a pong when
-    that is longer), plus a boundary retune that is due, fits the budget
-    :class:`ScienceScanPhase` would give it from now. That budget lasts
-    while the whole pattern, not only the field centre, stays inside the
-    telescope elevation limits, so a patch whose pattern edge is below
-    the lower limit (a rising field) or reaches it before a subscan fits
-    (a setting one) is passed over. :class:`SlewPhase` asks the same
-    question again at the slew's arrival.
+    - its ``scan_params`` pin ``rising`` and the field is on the other
+      side of the meridian (``rising=True`` needs a negative hour angle,
+      ``rising=False`` one of zero or more);
+    - it is a constant-elevation patch and the planner's own crossing
+      search finds no pass at its elevation (the field centre's current
+      elevation when the patch pins none) that is plannable from now and
+      opens before the window ends and within one tick plus a slew
+      allowance of now;
+    - it is a pong or daisy patch and the retune due now plus its
+      shortest subscan (``min_scan_duration``, or one pattern period for
+      a pong when that is longer) exceeds the budget
+      :class:`ScienceScanPhase` would give it from now.
 
-    If no patch scores above zero, emits an IDLE block advancing by
-    ``ctx.time_step`` and sets ``skip_to_next_iter=True``: the outer
-    scheduler should skip the slew/science phases for this iteration.
-    A pose the Sun zone has overtaken is moved out first instead of
-    idling in place (see :class:`SlewPhase`).
+    That budget runs from now until the first of: ``max_scan_duration``
+    elapsing; the end of the window; the field centre's track, at the pinned
+    elevation when the patch has one, entering the Sun zone; and, from
+    the end of the due retune, the pattern's lowest point falling below
+    the lower elevation limit or its bounding circle passing the upper
+    limit or reaching the zenith. A pattern outside the limits, or
+    holding the zenith, when the retune ends gets no budget. The pattern
+    follows the field's own track: a pong's lowest point is a corner of
+    its box, and its bounding circle is the circle about the field centre
+    through the corners; a daisy's bounding circle is the circle of its
+    reach about the centre, which also gives its lowest point, and the
+    reach exceeds its ``radius`` by at least its turn radius.
+    :class:`SlewPhase` asks the same question again at the slew's
+    arrival.
+
+    The highest-scoring patch left wins. If none is left, emits an IDLE
+    block advancing by ``ctx.time_step`` and sets
+    ``skip_to_next_iter=True``: the outer scheduler should skip the
+    slew/science phases for this iteration. A pose the Sun zone has
+    overtaken is moved out first instead of idling in place (see
+    :class:`SlewPhase`).
 
     Otherwise, returns no blocks but populates ``selection``,
     ``best_az``, ``best_el`` in the result so downstream phases can
@@ -790,7 +838,7 @@ class PatchSelectionPhase(Phase):
 
             # Honor a requested elevation crossing: a patch whose
             # scan_params pins "rising" is only selectable while the sky
-            # side matches (hour angle < 0 for rising, > 0 for setting).
+            # side matches (hour angle < 0 for rising, >= 0 for setting).
             # Without this a setting request would be scheduled at a
             # rising-side time and the planner's geometry/timing would
             # decohere from the request.

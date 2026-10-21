@@ -195,9 +195,9 @@ def inflate_footprint(fp: ArrayFootprint, margin_deg: float) -> ArrayFootprint:
     Raises
     ------
     ValueError
-        If ``margin_deg`` is negative or not finite.
+        If ``margin_deg`` is not a real number, is negative or is not finite.
     """
-    _require_non_negative(margin_deg, "margin_deg")
+    margin_deg = _require_non_negative(margin_deg, "margin_deg")
     dx = fp.cover_xi_deg - fp.center_xi_deg
     dy = fp.cover_eta_deg - fp.center_eta_deg
     radius = np.hypot(dx, dy)

@@ -33,6 +33,14 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt  # noqa: E402
 from astropy.time import Time  # noqa: E402
+from astropy.utils import iers  # noqa: E402
+
+# Earth orientation comes from the vendored IERS-A table the test suite pins, so
+# every figure renders the same bytes whatever table astropy has cached.
+_IERS_A_FILE = Path(__file__).resolve().parents[1] / "tests" / "data" / "finals2000A.all"
+iers.conf.auto_download = False
+if _IERS_A_FILE.exists():
+    iers.earth_orientation_table.set(iers.IERS_A.open(str(_IERS_A_FILE)))
 
 from fyst_trajectories import PRIMECAM_MODULES, InstrumentOffset, get_fyst_site  # noqa: E402
 from fyst_trajectories.planning import (  # noqa: E402

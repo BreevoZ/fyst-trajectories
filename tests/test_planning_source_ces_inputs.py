@@ -1,14 +1,15 @@
 """Tests for the source-CES scan-geometry inputs.
 
 Covers ``az_speed``, ``az_throw`` and ``dwell``, the refusal of non-scalar
-times, the swept azimuth envelope the kernel screens, and the caller-side
-margin transform.
+times, the swept azimuth envelope the kernel screens, a ``Decimal`` input,
+and the caller-side margin transform.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import warnings
+from decimal import Decimal
 
 import numpy as np
 import pytest
@@ -16,6 +17,7 @@ from _source_ces_helpers import (
     _FULL_PRIMECAM_MODULES,
     _JUPITER_NIGHT,
     _JUPITER_RISING_ANCHOR,
+    _assert_same_pass,
     _full_primecam_block,
 )
 from astropy import units as u
@@ -25,6 +27,7 @@ import fyst_trajectories.planning.source_ces._kernel as _source_ces_kernel
 from fyst_trajectories import (
     FYST_AZ_MAX_VELOCITY,
     MODULE_FOV_RADIUS_DEG,
+    AccelerationLimitWarning,
     AzimuthBoundsError,
     DwellExceedsCrossingError,
     PointingError,
@@ -34,6 +37,15 @@ from fyst_trajectories import (
     plan_source_ces_passes,
 )
 from fyst_trajectories.patterns.turnarounds import turnaround_overshoot_deg
+
+# The advisories of a throw or a dwell narrower than the crossing, for the
+# tests that plan one on purpose.
+_NARROW_THROW = (
+    r"ignore:az_throw=\S+ deg is narrower than the:fyst_trajectories.exceptions.PointingWarning"
+)
+_PARTIAL_DWELL = (
+    r"ignore:dwell=\S+ s is shorter than the:fyst_trajectories.exceptions.PointingWarning"
+)
 
 # ---------------------------------------------------------------------------
 # Scan-geometry inputs: az_speed, az_throw, dwell, and the margin transform
@@ -129,6 +141,7 @@ class TestAzThrowInput:
         with pytest.raises(ValueError, match="az_throw must be positive"):
             _one_module_params(site, az_throw=bad)
 
+    @pytest.mark.filterwarnings(_NARROW_THROW)
     def test_arc_sun_check_sees_the_overridden_envelope(self, site, monkeypatch):
         """The Sun sweep runs on the final swept window, so a narrower throw shrinks it."""
         seen: list[np.ndarray] = []
@@ -140,9 +153,7 @@ class TestAzThrowInput:
 
         monkeypatch.setattr(_source_ces_kernel, "_check_arc_sun_safety", spy)
         default = _one_module_params(site)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", PointingWarning)
-            narrow = _one_module_params(site, az_throw=1.0)
+        narrow = _one_module_params(site, az_throw=1.0)
         assert len(seen) == 2
         span_default = seen[0].max() - seen[0].min()
         span_narrow = seen[1].max() - seen[1].min()
@@ -210,7 +221,12 @@ class TestSweptEnvelope:
 
         monkeypatch.setattr(_source_ces_kernel, "_check_arc_sun_safety", spy)
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore", PointingWarning)
+            # An az_accel of 1.5 peaks past the acceleration limit at the turnarounds.
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Trajectory azimuth acceleration \(",
+                category=AccelerationLimitWarning,
+            )
             block = _full_primecam_block(site, footprint="c", **overrides)
         assert len(seen) == 1
         return seen[0], block
@@ -253,18 +269,16 @@ class TestSweptEnvelope:
         time; the refusal itself is pinned by the test below.
         """
         limits = site.telescope_limits.azimuth
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", PointingWarning)
-            block = _full_primecam_block(site, footprint="c", az_speed=az_speed)
-            cp = compute_source_ces_params(
-                body="jupiter",
-                footprint="c",
-                el_bore=35.0,
-                night=_JUPITER_NIGHT,
-                mode="rising",
-                site=site,
-                az_speed=az_speed,
-            )
+        block = _full_primecam_block(site, footprint="c", az_speed=az_speed)
+        cp = compute_source_ces_params(
+            body="jupiter",
+            footprint="c",
+            el_bore=35.0,
+            night=_JUPITER_NIGHT,
+            mode="rising",
+            site=site,
+            az_speed=az_speed,
+        )
         overshoot = turnaround_overshoot_deg(cp["az_speed"], 1.0)
         env_lo = min(cp["az_start"], cp["az_start"] + cp["az_throw"]) - overshoot
         env_hi = max(cp["az_start"], cp["az_start"] + cp["az_throw"]) + overshoot
@@ -284,9 +298,7 @@ class TestSweptEnvelope:
         only the turnaround overshoot pushes past them: without the widening
         the same call returns a params dict a dispatcher would then reject.
         """
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", PointingWarning)
-            cp = _one_module_params(site, az_speed=1.5)
+        cp = _one_module_params(site, az_speed=1.5)
         overshoot = turnaround_overshoot_deg(cp["az_speed"], 1.0)
         drift = cp["v_az"] * cp["duration"]
         sci_hi = max(cp["az_start"], cp["az_start"] + cp["az_throw"]) + max(0.0, drift)
@@ -300,10 +312,8 @@ class TestSweptEnvelope:
                 ),
             ),
         )
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", PointingWarning)
-            with pytest.raises(AzimuthBoundsError):
-                _one_module_params(tight, az_speed=1.5)
+        with pytest.raises(AzimuthBoundsError):
+            _one_module_params(tight, az_speed=1.5)
 
 
 class TestDwellInput:
@@ -314,11 +324,10 @@ class TestDwellInput:
         span = (Time(cp["t1_iso"]) - Time(cp["t0_iso"])).to_value(u.s)
         assert cp["crossing_seconds"] == pytest.approx(span, abs=1e-3)
 
+    @pytest.mark.filterwarnings(_PARTIAL_DWELL)
     def test_dwell_narrows_symmetrically_and_keeps_the_crossing(self, site):
         default = _one_module_params(site)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", PointingWarning)
-            cp = _one_module_params(site, dwell=300.0)
+        cp = _one_module_params(site, dwell=300.0)
         t0, t1 = Time(cp["t0_iso"]), Time(cp["t1_iso"])
         assert (t1 - t0).to_value(u.s) == pytest.approx(300.0, abs=1e-3)
         mid_default = Time(default["t0_iso"]) + 0.5 * (
@@ -375,11 +384,10 @@ class TestDwellInput:
         assert "dwell=8.0" in str(excinfo.value)
         assert "sampling_step_seconds=30.0" in str(excinfo.value)
 
+    @pytest.mark.filterwarnings(_PARTIAL_DWELL)
     def test_dwell_at_the_sampling_step_is_honoured_exactly(self, site):
         """At the floor the pass is exactly the requested length, not one step wider."""
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", PointingWarning)
-            cp = _one_module_params(site, dwell=10.0, sampling_step_seconds=10.0)
+        cp = _one_module_params(site, dwell=10.0, sampling_step_seconds=10.0)
         assert (Time(cp["t1_iso"]) - Time(cp["t0_iso"])).to_value(u.s) == pytest.approx(
             10.0, abs=1e-3
         )
@@ -397,38 +405,36 @@ class TestDwellInput:
                 dwell=120.0,
             )
 
+    @pytest.mark.filterwarnings(_PARTIAL_DWELL)
     def test_single_pass_sequence_accepts_dwell(self, site):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", PointingWarning)
-            (block,) = plan_source_ces_passes(
-                body="jupiter",
-                footprint="c",
-                el_bore=35.0,
-                n_passes=1,
-                night=_JUPITER_NIGHT,
-                mode="rising",
-                site=site,
-                dwell=300.0,
-            )
+        (block,) = plan_source_ces_passes(
+            body="jupiter",
+            footprint="c",
+            el_bore=35.0,
+            n_passes=1,
+            night=_JUPITER_NIGHT,
+            mode="rising",
+            site=site,
+            dwell=300.0,
+        )
         cp = block.computed_params
         assert (Time(cp["t1_iso"]) - Time(cp["t0_iso"])).to_value(u.s) == pytest.approx(
             300.0, abs=1e-3
         )
 
+    @pytest.mark.filterwarnings(_PARTIAL_DWELL)
     def test_anchored_dwell_pass_starts_half_the_cut_after_the_anchor(self, site):
         """The anchor places the full crossing; the dwell narrows about its midpoint."""
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", PointingWarning)
-            full = plan_source_ces(
-                body="jupiter", footprint="c", start_time=_JUPITER_RISING_ANCHOR, site=site
-            )
-            narrowed = plan_source_ces(
-                body="jupiter",
-                footprint="c",
-                start_time=_JUPITER_RISING_ANCHOR,
-                site=site,
-                dwell=300.0,
-            )
+        full = plan_source_ces(
+            body="jupiter", footprint="c", start_time=_JUPITER_RISING_ANCHOR, site=site
+        )
+        narrowed = plan_source_ces(
+            body="jupiter",
+            footprint="c",
+            start_time=_JUPITER_RISING_ANCHOR,
+            site=site,
+            dwell=300.0,
+        )
         assert narrowed.computed_params["el_bore"] == pytest.approx(full.computed_params["el_bore"])
         crossing = full.computed_params["crossing_seconds"]
         expected_delay = 0.5 * (crossing - 300.0)
@@ -438,6 +444,36 @@ class TestDwellInput:
         assert (Time(cp["t1_iso"]) - Time(cp["t0_iso"])).to_value(u.s) == pytest.approx(
             300.0, abs=1e-3
         )
+
+
+class TestDecimalInputs:
+    """A ``Decimal`` speed, acceleration, padding, dwell or step plans exactly as its float does.
+
+    The kernel computes with the float each check returns, and so do both
+    entry points after it.
+    """
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("az_accel", "0.5"),
+            ("az_padding", "0.5"),
+            pytest.param("dwell", "300.0", marks=pytest.mark.filterwarnings(_PARTIAL_DWELL)),
+            ("sampling_step_seconds", "15.0"),
+        ],
+    )
+    def test_params_equal_those_of_the_float(self, site, name, value):
+        """The params, the priced azimuth envelope included, equal those of the float."""
+        got = _one_module_params(site, **{name: Decimal(value)})
+        assert got == _one_module_params(site, **{name: float(value)})
+
+    @pytest.mark.parametrize(("name", "value"), [("az_speed", "1.5"), ("az_accel", "0.5")])
+    def test_block_is_the_pass_of_the_float(self, site, name, value):
+        """The config and the trajectory are built from the speed's and acceleration's floats."""
+        got = _full_primecam_block(site, footprint="c", **{name: Decimal(value)})
+        want = _full_primecam_block(site, footprint="c", **{name: float(value)})
+        _assert_same_pass(got, want)
+        assert got.config == want.config
 
 
 class TestInflateFootprint:
@@ -487,6 +523,16 @@ class TestInflateFootprint:
 
         with pytest.raises(ValueError, match="margin_deg must be non-negative"):
             inflate_footprint(resolve_footprint("c"), -0.1)
+
+    def test_decimal_margin_inflates_as_its_float(self):
+        """A ``Decimal`` margin inflates the footprint exactly as its float does."""
+        from fyst_trajectories.planning.footprints import inflate_footprint, resolve_footprint
+
+        base = resolve_footprint("c")
+        expected = inflate_footprint(base, 0.4)
+        got = inflate_footprint(base, Decimal("0.4"))
+        np.testing.assert_array_equal(got.cover_xi_deg, expected.cover_xi_deg)
+        np.testing.assert_array_equal(got.cover_eta_deg, expected.cover_eta_deg)
 
     def test_margin_lengthens_the_crossing(self, site):
         """One module plus 0.4 deg per side reproduces a wider, longer pass."""

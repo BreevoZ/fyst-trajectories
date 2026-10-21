@@ -335,9 +335,12 @@ def inject_retune(
     verification): Prime-Cam has 7 independent readout modules. If modules
     can retune independently, setting ``n_modules > 1`` offsets the first
     retune by ``module_index * retune_interval / n_modules``, so only one
-    module is retuning at a time, as long as ``retune_duration`` is shorter
-    than ``retune_interval / n_modules`` (it is, at the defaults; the
-    library enforces only ``retune_duration < retune_interval``). Each
+    module is retuning at a time, as long as ``retune_duration`` is at most
+    ``retune_interval / n_modules`` (it is, at the defaults). A longer
+    ``retune_duration`` is accepted with a warning, and up to
+    ``ceil(retune_duration * n_modules / retune_interval)`` modules then
+    retune at once (the library refuses only
+    ``retune_duration >= retune_interval``). Each
     module still pays ``retune_duration / (retune_interval + retune_duration)``
     of its own time (about 1.6% at the defaults, 5 s in every 305 s) whether
     or not retunes are staggered; what staggering changes is where the loss
@@ -436,9 +439,12 @@ def inject_retune(
     Warns
     -----
     PointingWarning
-        If ``retune_events`` is supplied together with a non-default
-        ``retune_interval`` or ``retune_duration`` (the scalar kwarg is
-        ignored in event-list mode). If any event has ``t_start`` at or
+        If ``n_modules > 1`` and ``retune_duration`` is longer than
+        ``retune_interval / n_modules`` (uniform-cadence mode): the staggered
+        retunes overlap, and the warning says how many modules retune at
+        once at most. If ``retune_events`` is supplied together with a
+        non-default ``retune_interval`` or ``retune_duration`` (the scalar
+        kwarg is ignored in event-list mode). If any event has ``t_start`` at or
         after the trajectory end (those events are dropped with a single
         summary warning naming the affected sorted indices). If
         ``prefer_turnarounds=True`` but the trajectory has identically
@@ -513,6 +519,20 @@ def inject_retune(
         raise ValueError(f"n_modules must be >= 1, got {n_modules}")
     if module_index < 0 or module_index >= n_modules:
         raise ValueError(f"module_index must be in [0, {n_modules}), got {module_index}")
+    # Adjacent modules start their retunes one stagger apart and every module
+    # repeats after retune_interval + retune_duration, so the retunes overlap
+    # exactly when one outlasts the stagger; the most at once is then the
+    # number of stagger offsets inside one retune.
+    stagger = retune_interval / n_modules
+    if n_modules > 1 and retune_duration > stagger:
+        at_once = min(n_modules, math.ceil(retune_duration / stagger))
+        warnings.warn(
+            f"Staggered retunes overlap: retune_duration {retune_duration:g} s is longer "
+            f"than retune_interval / n_modules = {stagger:.4g} s, so up to {at_once} of "
+            f"the {n_modules} modules retune at once.",
+            PointingWarning,
+            stacklevel=2,
+        )
 
     # Defensive guard: turnaround detection relies on real velocities (the
     # uniform-cadence helper classifies turnarounds from

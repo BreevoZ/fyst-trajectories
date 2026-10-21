@@ -2,7 +2,6 @@
 
 import dataclasses
 import json
-import warnings
 
 import numpy as np
 import pytest
@@ -35,7 +34,9 @@ from fyst_trajectories.overhead.calibration_night.policy import (
     tables_as_record,
     tables_from_record,
 )
+from fyst_trajectories.overhead.calibration_night.reporting import _LATENESS_RULE
 from fyst_trajectories.overhead.calibration_night.tables import DEFAULT_SCAN_TABLES
+from fyst_trajectories.overhead.utils import _search_start_time
 
 # A pass dict of the keys the pinned execution layer's source-scan task reads,
 # plus the two sequence keys it has no use for.
@@ -82,15 +83,13 @@ def _night_of_parked_passes(scan_params):
 @pytest.fixture(scope="module")
 def im0_night():
     """Plan the package's short night again, with the centre module named ``IM0``."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        return plan_calibration_night(
-            ["saturn", "uranus"],
-            get_fyst_site(),
-            "2026-09-11T06:30:00",
-            "2026-09-11T07:30:00",
-            policy=CalibrationNightPolicy(footprint="IM0"),
-        )
+    return plan_calibration_night(
+        ["saturn", "uranus"],
+        get_fyst_site(),
+        "2026-09-11T06:30:00",
+        "2026-09-11T07:30:00",
+        policy=CalibrationNightPolicy(footprint="IM0"),
+    )
 
 
 class TestSummary:
@@ -114,7 +113,7 @@ class TestSummary:
             "waiting_for_pass",
             "window_closed",
         }
-        assert {d["reason"] for d in summary.deferrals} == {"window_closed"}
+        assert summary.deferrals == ()
         assert any("on-sky azimuth speed" in w for w in summary.warnings)
 
     def test_text_rendering(self, short_night):
@@ -218,6 +217,38 @@ class TestDispatchSheet:
         for row, wait in zip(pass_rows, waits):
             assert f"slack {wait:.0f} s" in row
 
+    def test_header_states_the_rule_and_the_lead(self, short_night):
+        """The header carries the execution layer's rule and the lead the policy reserved."""
+        _, timeline = short_night
+        lines = dispatch_sheet(timeline).splitlines()
+        assert lines[1] == f"# lateness rule: {_LATENESS_RULE}"
+        lead = CalibrationNightPolicy().dispatch_lead_seconds
+        assert lines[2].startswith(f"# dispatch lead: {lead:.0f} s reserved before every pass")
+        assert lines[3] == "#   row  start                 duration  action"
+
+    def test_scheduled_t0_is_where_the_search_began(self, short_night):
+        """The dict line hands the execution layer the search start, not the pass start."""
+        _, timeline = short_night
+        blocks = sorted(timeline.blocks, key=lambda b: b.t_start.unix)
+        passes = [b for b in blocks if b.metadata.get("cal_type") == "planet_cal"]
+        lines = [ln for ln in dispatch_sheet(timeline).splitlines() if "scheduled_t0_unix=" in ln]
+        assert len(lines) == len(passes) == 3
+        for block, line in zip(passes, lines):
+            printed = float(line.rsplit("scheduled_t0_unix=", 1)[1])
+            anchor = _search_start_time(block.metadata["search_start"])
+            assert printed == pytest.approx(anchor.unix, abs=1e-3)
+            assert 0.0 < (block.t_start - anchor).to_value("s") < 60.0
+        # A block written without the record (an older night) gives its start.
+        first = passes[0]
+        metadata = {k: v for k, v in first.metadata.items() if k != "search_start"}
+        stripped = [
+            dataclasses.replace(first, metadata=metadata) if b is first else b for b in blocks
+        ]
+        older = dataclasses.replace(timeline, blocks=stripped)
+        line = next(ln for ln in dispatch_sheet(older).splitlines() if "scheduled_t0_unix=" in ln)
+        printed = float(line.rsplit("scheduled_t0_unix=", 1)[1])
+        assert printed == pytest.approx(first.t_start.unix, abs=1e-3)
+
     def test_identical_after_round_trip(self, short_night, tmp_path):
         _, timeline = short_night
         path = tmp_path / "night.ecsv"
@@ -225,6 +256,38 @@ class TestDispatchSheet:
         back = read_timeline(path)
         assert dispatch_sheet(back) == dispatch_sheet(timeline)
         assert str(summarize_calibration_night(back)) == str(summarize_calibration_night(timeline))
+
+    @pytest.mark.parametrize("search_start", [True, False], ids=["search-start", "start-only"])
+    def test_identical_after_round_trip_on_a_leap_second_day(
+        self, leap_second_day_night, search_start, tmp_path
+    ):
+        """Every time and duration prints as the file stores it.
+
+        Without ``search_start`` the sheet hands over the pass start, whose
+        Unix time on 2016-12-31 differs in its third decimal between the
+        instant in memory and the millisecond in the file. The slew sits on
+        a rounding edge: 2.9996 s held in memory printed as 0.0 min, while
+        the 3.000 s between the stored milliseconds prints as 0.1 min, from
+        memory and from the file alike.
+        """
+        night = leap_second_day_night(search_start=search_start)
+        start = night.blocks[-1].t_start
+        assert round(float(start.unix), 3) != round(float(Time(start.iso, scale="utc").unix), 3)
+        path = tmp_path / "night.ecsv"
+        write_timeline(night, path)
+        sheet = dispatch_sheet(night)
+        assert dispatch_sheet(read_timeline(path)) == sheet
+        slew = night.blocks[0]
+        stored = Time(slew.t_stop.iso, scale="utc") - Time(slew.t_start.iso, scale="utc")
+        slew_row = next(line for line in sheet.splitlines() if " slew az " in line)
+        assert f"{stored.to_value('s') / 60.0:7.1f} min" in slew_row
+        assert f"{slew.duration / 60.0:7.1f} min" not in slew_row, "the slew is off the edge"
+        printed = float(sheet.rsplit("scheduled_t0_unix=", 1)[1].split()[0])
+        if search_start:
+            anchor = _search_start_time(night.blocks[-1].metadata["search_start"])
+            assert printed == round(float(anchor.unix), 3)
+        else:
+            assert printed == round(float(Time(start.iso, scale="utc").unix), 3)
 
     def test_every_block_metadata_is_json(self, short_night):
         _, timeline = short_night
@@ -322,7 +385,7 @@ class TestMetadataPayload:
         json.dumps(record)
 
     def test_the_payload_records_the_axis_limits(self, short_night, tmp_path):
-        """The ECSV header does not carry them, so the payload does."""
+        """The payload keeps its own copy, the one a resume holds the site to."""
         site, timeline = short_night
         limits = dataclasses.asdict(site.telescope_limits)
         assert read_calibration_night_metadata(timeline)["telescope_limits"] == limits

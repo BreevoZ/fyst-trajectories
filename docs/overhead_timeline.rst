@@ -19,14 +19,19 @@ near rising and setting such a patch is passed over while its centre is
 still inside the limits. The pong's whole box is taken at every instant,
 while the pattern passes near each corner once a period, so near setting a
 pong can stop up to a period before its own trajectory would reach the
-limit. A visit whose first science subscan cannot be planned books nothing,
-and that tick idles: the planner refuses the subscan (a pong first retries
-with fewer periods), or the subscan no longer fits by the time the slew
-would arrive, and then the telescope does not slew. A slew whose direct
-path would cross the Sun zone is refused, and that tick idles at the
-unmoved pose and retries once the Sun has moved. A parked pose the zone has
-overtaken is moved out of it before anything else runs that tick. See
-:doc:`sun_avoidance` for the Sun policy these checks apply.
+limit. The pattern must also keep clear of the zenith: such a patch is
+passed over while the circle about the field centre that bounds its
+pattern (through a pong's corners, at a daisy's reach) holds the zenith,
+since a track that passes round the zenith winds its azimuth through whole
+turns, which the planner refuses. A visit whose first science subscan
+cannot be planned books nothing, and that tick idles: the planner refuses
+the subscan (a pong first retries with fewer periods), or the subscan no
+longer fits by the time the slew would arrive, and then the telescope does
+not slew. A slew whose direct path would cross the Sun zone is refused, and
+that tick idles at the unmoved pose and retries once the Sun has moved. A
+parked pose the zone has overtaken is moved out of it before anything else
+runs that tick. See :doc:`sun_avoidance` for the Sun policy these checks
+apply.
 
 Defining Patches
 ----------------

@@ -24,7 +24,8 @@ from typing import Any, Generic, Literal, TypedDict, TypeVar
 
 import numpy as np
 
-from .._validation import _require_positive
+from .._readonly import ReadOnlyDict
+from .._validation import _require_finite, _require_positive
 from ..exceptions import PointingWarning
 from ..patterns.configs import ScanConfig
 from ..trajectory import Trajectory
@@ -252,7 +253,8 @@ class FieldRegion:
     Raises
     ------
     ValueError
-        If width or height is not positive.
+        If width or height is a ``bool``, an array of one or more
+        dimensions, text or ``None``, or is not positive.
 
     Examples
     --------
@@ -265,8 +267,9 @@ class FieldRegion:
     height: float
 
     def __post_init__(self) -> None:
-        _require_positive(self.width, "width")
-        _require_positive(self.height, "height")
+        # Frozen dataclass: object.__setattr__ stores the float each check returns.
+        for name in ("width", "height"):
+            object.__setattr__(self, name, _require_positive(getattr(self, name), name))
 
     @property
     def dec_min(self) -> float:
@@ -297,8 +300,10 @@ class ArrayFootprint:
     ----------
     center_xi_deg : float
         Cross-elevation coordinate of the footprint center, in degrees.
+        Stored as a float.
     center_eta_deg : float
         Elevation coordinate of the footprint center, in degrees.
+        Stored as a float.
     cover_xi_deg : np.ndarray
         Cross-elevation coordinates of polygon vertices, in degrees.
         Must be 1-D and have the same length as ``cover_eta_deg``.
@@ -309,8 +314,10 @@ class ArrayFootprint:
     Raises
     ------
     ValueError
-        If the cover arrays are not 1-D, are different lengths, or
-        are empty.
+        If ``center_xi_deg`` or ``center_eta_deg`` is a ``bool``, an array of
+        one or more dimensions, text or ``None``, or is not finite; if the
+        cover arrays are not 1-D, are different lengths, or are empty; or if
+        a cover coordinate is not finite, naming its array and index.
 
     Notes
     -----
@@ -348,6 +355,9 @@ class ArrayFootprint:
     cover_eta_deg: np.ndarray
 
     def __post_init__(self) -> None:
+        # The center is stored as the float its check returns (frozen-field idiom).
+        for name in ("center_xi_deg", "center_eta_deg"):
+            object.__setattr__(self, name, _require_finite(getattr(self, name), name))
         cover_xi = np.array(self.cover_xi_deg, dtype=float)
         cover_eta = np.array(self.cover_eta_deg, dtype=float)
         if cover_xi.ndim != 1 or cover_eta.ndim != 1:
@@ -362,6 +372,10 @@ class ArrayFootprint:
             )
         if cover_xi.size == 0:
             raise ValueError("ArrayFootprint cover polygon must have at least one vertex")
+        for name, cover in (("cover_xi_deg", cover_xi), ("cover_eta_deg", cover_eta)):
+            bad = np.flatnonzero(~np.isfinite(cover))
+            if bad.size:
+                raise ValueError(f"{name}[{bad[0]}] must be a finite number, got {cover[bad[0]]}")
         # frozen=True precludes normal assignment, so object.__setattr__
         # stores the float-canonicalised arrays. np.array always copies, so
         # the footprint owns its arrays and can make them read-only.
@@ -413,7 +427,10 @@ class ArrayFootprint:
         Raises
         ------
         ValueError
-            If ``units`` is neither ``'rad'`` nor ``'deg'``.
+            If ``units`` is neither ``'rad'`` nor ``'deg'``, if a center
+            coordinate is a ``bool``, an array of one or more dimensions,
+            text or ``None``, or is not finite, or as the constructor raises
+            for the converted cover (a NaN vertex, for one).
 
         Examples
         --------
@@ -434,9 +451,13 @@ class ArrayFootprint:
         scale = float(np.rad2deg(1.0)) if units == "rad" else 1.0
         center = array_info["center"]
         cover = array_info["cover"]
+        # Checked before the conversion: float() would read a bool as 0 or 1
+        # and parse text.
+        center_xi = _require_finite(center[0], "array_info['center'][0]")
+        center_eta = _require_finite(center[1], "array_info['center'][1]")
         return cls(
-            center_xi_deg=float(center[0]) * scale,
-            center_eta_deg=float(center[1]) * scale,
+            center_xi_deg=center_xi * scale,
+            center_eta_deg=center_eta * scale,
             cover_xi_deg=np.asarray(cover[0], dtype=float) * scale,
             cover_eta_deg=np.asarray(cover[1], dtype=float) * scale,
         )
@@ -467,7 +488,11 @@ class ScanBlock(Generic[_ParamsT_co]):
         :class:`DaisyAltAzComputedParams`, or
         :class:`SourceCESComputedParams`. The block's type parameter is
         that schema, so ``plan_pong_scan`` returns a
-        ``ScanBlock[PongComputedParams]``.
+        ``ScanBlock[PongComputedParams]``. Stored as a read-only copy: it is
+        still a ``dict``, but item assignment, ``update``, ``pop`` and the
+        other mutating methods raise ``TypeError``. Derive an edited block
+        with :func:`dataclasses.replace`, and convert with ``dict(...)``
+        before editing a copy or dumping it to YAML.
     summary : str
         Human-readable summary of the planned observation.
 
@@ -489,10 +514,13 @@ class ScanBlock(Generic[_ParamsT_co]):
     trajectory: Trajectory
     config: ScanConfig
     duration: float
-    # Runtime is a plain ``dict``; the schema type is advisory for static
-    # checkers, which cannot match the ``dict`` default to it.
+    # Runtime is a read-only ``dict`` subclass; the schema type is advisory
+    # for static checkers, which cannot match the ``dict`` default to it.
     computed_params: _ParamsT_co = dataclasses.field(default_factory=dict)  # type: ignore[assignment]
     summary: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "computed_params", ReadOnlyDict(self.computed_params))
 
 
 # Expected keys per scan type, derived from each TypedDict's

@@ -7,8 +7,6 @@ without driving the whole scheduler loop. A composition test checks that
 the loop reproduces ``generate_timeline``.
 """
 
-import warnings
-
 import pytest
 from _scheduler_helpers import _initial_state, _make_ctx
 from astropy.time import Time, TimeDelta
@@ -601,14 +599,12 @@ class TestSchedulerComposition:
         """
         from fyst_trajectories.overhead import BlockType, generate_timeline
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            timeline = generate_timeline(
-                patches=[_deep56_ce_patch()],
-                site=get_fyst_site(),
-                start_time="2026-06-15T02:00:00",
-                end_time="2026-06-15T06:12:57",
-            )
+        timeline = generate_timeline(
+            patches=[_deep56_ce_patch()],
+            site=get_fyst_site(),
+            start_time="2026-06-15T02:00:00",
+            end_time="2026-06-15T06:12:57",
+        )
 
         last = timeline.blocks[-1]
         assert last.t_stop.unix == pytest.approx(timeline.end_time.unix, abs=0.01)
@@ -928,8 +924,9 @@ class TestUnpinnedConstantElevation:
     """A constant-elevation patch must pin its elevation to be scheduled.
 
     The crossing-pass gate solves at the patch's pinned elevation; an
-    unpinned patch would fall back to the field centre's current elevation,
-    which its leading edge has already crossed, so it would never be selected.
+    unpinned patch fell back to the field centre's current elevation, which
+    its leading edge has usually already crossed, so it was selected only
+    rarely.
     """
 
     def test_build_refuses_an_unpinned_patch(self):

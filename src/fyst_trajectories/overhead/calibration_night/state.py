@@ -244,7 +244,8 @@ class NightState:
             If the record's schema version is not supported, the night has
             no usable interval, ``t`` is before its usable start,
             ``selection`` is not the rule the night recorded, the recorded
-            policy is one
+            policy holds a key this version of the library does not know
+            (named in the message) or is one
             :class:`~fyst_trajectories.overhead.CalibrationNightPolicy`
             refuses, or an entry set aside carries no time (a record written
             before the time was recorded).
@@ -574,9 +575,11 @@ class NightContext:
             :func:`~fyst_trajectories.overhead.plan_calibration_night`, in
             memory or read back from ECSV.
         site : Site, optional
-            Default ``timeline.site``. A timeline read back from ECSV
-            carries the FYST axis limits whatever the night was planned on,
-            so a night planned on other limits needs its site passed in.
+            Default ``timeline.site``, which carries the axis limits the
+            night was planned on, in memory or read back from ECSV. A file
+            written before its header held the axis limits reads back with
+            the FYST limits, so a night planned on other limits needs its
+            site passed in to resume from such a file.
         sun_safe : SunSafePredicate, optional
             Default as in :meth:`build`. The record keeps only the
             predicate's description, so a night planned on another model,
@@ -598,7 +601,8 @@ class NightContext:
         ValueError
             If the record's schema version is not supported, the site's
             axis limits differ from those the record holds, the recorded
-            policy is one
+            policy holds a key this version of the library does not know
+            (named in the message) or is one
             :class:`~fyst_trajectories.overhead.CalibrationNightPolicy`
             refuses, a Sun predicate's description differs from the
             recorded one, or the usable interval resolved here differs from

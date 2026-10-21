@@ -4,8 +4,8 @@
 # then produces a whole-file diff on an unrelated file.
 * text=auto eol=lf
 
-# Vendored binary fixtures (IERS table excerpts are text; ephemeris kernels and
-# the parity archive are not).
+# Binary files: the ephemeris kernels and NumPy archives under tests/data and the
+# documentation figures (the vendored IERS table excerpts are text).
 *.bsp binary
 *.npz binary
 *.png binary
